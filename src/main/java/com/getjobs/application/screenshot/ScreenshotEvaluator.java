@@ -2,8 +2,11 @@ package com.getjobs.application.screenshot;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -18,6 +21,16 @@ public class ScreenshotEvaluator {
             "^(?:薪资|薪酬|工资)?(?:面议|待定|保密|未提供|未注明|未标明|暂无|暂未提供|不详)(?:[/／]?(?:天|日|月))?$");
     private static final Pattern NOT_INTERNSHIP = Pattern.compile(
             "非实习|不(?:接受|接收|招聘|招收|考虑|招)\\s*(?:在校)?实习");
+    private static final Map<String, String> UNCERTAIN_LABELS = Map.ofEntries(
+            Map.entry("salaryText", "薪资原文"), Map.entry("salaryMin", "薪资金额下限"),
+            Map.entry("salaryMax", "薪资金额上限"), Map.entry("salaryUnit", "薪资计薪单位"),
+            Map.entry("city", "工作城市"), Map.entry("graduationYears", "毕业届次"),
+            Map.entry("jobTitle", "岗位名称"), Map.entry("company", "公司名称"),
+            Map.entry("description", "职位描述"), Map.entry("daysPerWeek", "每周到岗天数"),
+            Map.entry("durationMonths", "实习时长"), Map.entry("education", "学历要求"),
+            Map.entry("skills", "技能标签"));
+    private static final Set<String> SALARY_FIELDS =
+            Set.of("salaryText", "salaryMin", "salaryMax", "salaryUnit");
 
     public ScreenshotEvaluation evaluate(ScreenshotFields fields, ScreenshotRules rules) {
         if (fields == null || rules == null) throw new IllegalArgumentException("截图字段和筛选规则不能为空");
@@ -60,9 +73,7 @@ public class ScreenshotEvaluator {
                 mismatches.add("截图注明的毕业届次不包含目标届次");
             }
         }
-        if (!fields.uncertainFields().isEmpty()) {
-            mismatches.add("模型明确标记字段识别不清或存在歧义，按识别失败处理");
-        }
+        markUncertainFields(fields.uncertainFields(), rules, mismatches, warnings);
         if (!mismatches.isEmpty()) return new ScreenshotEvaluation("MISMATCH", mismatches, warnings);
         return new ScreenshotEvaluation("MATCH", List.of(warnings.isEmpty()
                 ? "已识别信息满足当前Java筛选规则" : "已给信息未见明确不符；缺失条件按符合处理"), warnings);
@@ -133,6 +144,35 @@ public class ScreenshotEvaluator {
             mismatches.add(comparisonUnit.equals("DAY")
                     ? "岗位日薪下限低于最低日薪要求" : "岗位月薪下限低于最低月薪要求");
         }
+    }
+
+    /**
+     * An unclear field rejects the job only when this run's decision depends on it. The site itself
+     * truncates long job titles, so that signal is recorded without ending screening.
+     */
+    private static void markUncertainFields(List<String> uncertain, ScreenshotRules rules,
+                                            List<String> mismatches, List<String> warnings) {
+        LinkedHashSet<String> blocking = new LinkedHashSet<>();
+        LinkedHashSet<String> advisory = new LinkedHashSet<>();
+        boolean unknownField = false;
+        for (String field : uncertain) {
+            String label = UNCERTAIN_LABELS.get(field);
+            if (label == null) {
+                unknownField = true;
+                continue;
+            }
+            boolean decisionDependsOnField = SALARY_FIELDS.contains(field)
+                    || (field.equals("city") && !rules.cities().isEmpty())
+                    || (field.equals("graduationYears") && rules.graduationYear() != null);
+            (decisionDependsOnField ? blocking : advisory).add(label);
+        }
+        for (String label : blocking) {
+            mismatches.add("模型标记" + label + "识别不清或存在歧义，按识别失败处理");
+        }
+        for (String label : advisory) {
+            warnings.add("模型标记" + label + "识别不清，按提醒保留");
+        }
+        if (unknownField) warnings.add("模型标记了未识别的字段，按提醒保留");
     }
 
     private static SalaryObservation parseSalary(String raw) {

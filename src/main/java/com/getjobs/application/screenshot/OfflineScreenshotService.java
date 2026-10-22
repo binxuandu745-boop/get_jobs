@@ -1,5 +1,7 @@
 package com.getjobs.application.screenshot;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import javax.imageio.ImageIO;
@@ -23,6 +25,7 @@ public class OfflineScreenshotService {
     public static final int MAX_IMAGE_BYTES = VisionImage.MAX_IMAGE_BYTES;
     public static final int MAX_IMAGES = VisionImage.MAX_IMAGES;
     public static final int MAX_TOTAL_BYTES = VisionImage.MAX_TOTAL_BYTES;
+    private static final Logger log = LoggerFactory.getLogger(OfflineScreenshotService.class);
     private final VisionModelClient client;
     private final ScreenshotVisionConfigService config;
     private final ScreenshotResultStore store;
@@ -73,8 +76,11 @@ public class OfflineScreenshotService {
             } catch (ScreenshotVisionException failure) {
                 result = failed(id, sources, model, failure.getCode(), failure.getMessage());
             } catch (IllegalArgumentException invalidFields) {
+                String reason = validationReason(invalidFields);
+                // Parser messages name a field or a rule only; model text never reaches this log.
+                log.warn("截图识别输出未通过字段校验：{}（识别记录 {}）", reason, id);
                 result = failed(id, sources, model, "INVALID_EXTRACTION",
-                        "AI输出未通过字段校验，本次按不符合条件处理");
+                        "AI输出未通过字段校验：" + reason);
             }
             store.save(id, originals, result);
             return result;
@@ -109,6 +115,14 @@ public class OfflineScreenshotService {
                 first.imageSha256(), null, new ScreenshotEvaluation("MISMATCH",
                 List.of("识别失败，按不符合条件处理：" + message), List.of()),
                 code, message, model, sources);
+    }
+
+    /** Field-parser messages carry a field name or a rule name, never the model body; still bound them. */
+    private static String validationReason(IllegalArgumentException failure) {
+        String message = failure.getMessage();
+        if (message == null || message.isBlank()) return "字段格式无效";
+        String cleaned = message.replaceAll("[\\p{Cntrl}]", " ").trim();
+        return cleaned.length() > 120 ? cleaned.substring(0, 120) : cleaned;
     }
 
     private String validateImage(byte[] bytes) {

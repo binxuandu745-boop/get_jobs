@@ -522,7 +522,10 @@ public final class BossJobScreenshotCapture {
                 return (el.scrollHeight > el.clientHeight + 2 && /(hidden|clip)/.test(css.overflowY))
                   || (el.scrollWidth > el.clientWidth + 2 && /(hidden|clip)/.test(css.overflowX));
               };
-              if ([description, ...description.querySelectorAll('*')].some(clipped)
+              // Ellipsis and line-clamp inside the JD are ordinary page styling: the screenshots show
+              // exactly the visible pixels. Only the JD block itself being clipped hides text that no
+              // scroll can reach, so descendants must not abort the whole capture.
+              if (clipped(description)
                   || (description.scrollHeight > description.clientHeight + 2 && inner !== description))
                 throw new Error('Job description contains inaccessible clipped text');
               const section = description.closest('.job-detail-section, .job-sec') || description.parentElement;

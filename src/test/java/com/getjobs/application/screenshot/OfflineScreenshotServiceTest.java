@@ -63,6 +63,8 @@ class OfflineScreenshotServiceTest {
         assertEquals("MISMATCH", result.evaluation().decision());
         assertEquals("INVALID_EXTRACTION", result.errorCode());
         assertNull(result.fields());
+        assertTrue(result.errorMessage().contains("未通过字段校验"));
+        assertFalse(result.errorMessage().contains("not JSON"));
         String saved = Files.readString(temp.resolve(result.id()).resolve("result.json"));
         assertFalse(saved.contains("provider secret"));
     }
@@ -108,6 +110,7 @@ class OfflineScreenshotServiceTest {
         assertEquals("MISMATCH", result.evaluation().decision());
         assertEquals("INVALID_EXTRACTION", result.errorCode());
         assertNull(result.fields());
+        assertTrue(result.errorMessage().contains("salaryMin"));
     }
 
     @Test

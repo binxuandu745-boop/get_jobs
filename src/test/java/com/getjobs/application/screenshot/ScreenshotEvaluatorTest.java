@@ -88,6 +88,52 @@ class ScreenshotEvaluatorTest {
     }
 
     @Test
+    void truncatedJobTitleIsRecordedWithoutRejectingAnOtherwiseMatchingJob() {
+        var fields = fields("Java实习生（后端/需…", "150-200元/天", "150", "200", "DAY",
+                List.of(2028), List.of("jobTitle"));
+        var result = evaluator.evaluate(fields, ScreenshotRules.defaults());
+        assertEquals("MATCH", result.decision());
+        assertTrue(result.warnings().stream().anyMatch(warning -> warning.contains("岗位名称识别不清")));
+    }
+
+    @Test
+    void unclearCityOnlyMattersWhenTheRunRestrictsCities() {
+        var fields = fields("Java实习生", "150-200元/天", "150", "200", "DAY", List.of(2028), List.of("city"));
+        assertEquals("MATCH", evaluator.evaluate(fields, ScreenshotRules.defaults()).decision());
+        ScreenshotRules tianjin = new ScreenshotRules(List.of("java"), true, new BigDecimal("125"),
+                new BigDecimal("5000"), List.of("天津市"), 2028);
+        assertEquals("MISMATCH", evaluator.evaluate(fields, tianjin).decision());
+    }
+
+    @Test
+    void unclearGraduationYearOnlyMattersWhenAYearIsRequired() {
+        var fields = fields("Java实习生", "150-200元/天", "150", "200", "DAY",
+                List.of(2028), List.of("graduationYears"));
+        assertEquals("MISMATCH", evaluator.evaluate(fields, ScreenshotRules.defaults()).decision());
+        ScreenshotRules anyYear = new ScreenshotRules(List.of("java"), true, new BigDecimal("125"),
+                new BigDecimal("5000"), List.of(), null);
+        assertEquals("MATCH", evaluator.evaluate(fields, anyYear).decision());
+    }
+
+    @Test
+    void unclearSalaryOrItsUnitAlwaysRejectsBecauseTheSalaryRuleAlwaysApplies() {
+        for (String field : List.of("salaryText", "salaryMin", "salaryMax", "salaryUnit")) {
+            var fields = fields("Java实习生", "150-200元/天", "150", "200", "DAY",
+                    List.of(2028), List.of(field));
+            assertEquals("MISMATCH", evaluator.evaluate(fields, ScreenshotRules.defaults()).decision(), field);
+        }
+    }
+
+    @Test
+    void unknownUncertainFieldIsAdvisoryRatherThanFatal() {
+        var fields = fields("Java实习生", "150-200元/天", "150", "200", "DAY",
+                List.of(2028), List.of("jobId"));
+        var result = evaluator.evaluate(fields, ScreenshotRules.defaults());
+        assertEquals("MATCH", result.decision());
+        assertTrue(result.warnings().stream().anyMatch(warning -> warning.contains("未识别的字段")));
+    }
+
+    @Test
     void clearlyWrongRoleOrGraduationYearCanBeRejectedWithOtherWarningsPreserved() {
         assertEquals("MISMATCH", evaluator.evaluate(fields("行政助理实习生", "150-200元/天", "150", "200",
                 "DAY", List.of(), List.of()), ScreenshotRules.defaults()).decision());
