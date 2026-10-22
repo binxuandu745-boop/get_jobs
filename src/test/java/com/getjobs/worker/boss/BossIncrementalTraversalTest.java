@@ -219,20 +219,46 @@ class BossIncrementalTraversalTest {
     }
 
     @Test
-    void missingIdentifiersInBothCardAndResponsePauseWithoutGuessingAJob() {
+    void missingIdentifiersInBothCardAndResponseAreSkippedWithoutGuessingAJob() {
         addCards("card-without-link");
         when(cardLinks.get(0).count()).thenReturn(0);
         JSONObject root = new JSONObject().put("zpData", new JSONObject().put("jobInfo",
-                new JSONObject().put("jobName", "Java实习生")));
+                new JSONObject().put("jobName", "Java实习生").put("postDescription", "整理文档")));
         var detail = new BossJobDetailReader.Detail(root.toString(), root);
+        List<String> progress = new ArrayList<>();
+        boss.setProgressCallback((message, current, total) -> progress.add(message));
+        doReturn(false).when(boss).loadNextJobBatch(anyString(), anyInt());
 
         try (MockedStatic<BossJobDetailAwaiter> awaited = mockStatic(BossJobDetailAwaiter.class);
              MockedStatic<PlaywrightUtil> sleeps = mockStatic(PlaywrightUtil.class)) {
             awaited.when(() -> BossJobDetailAwaiter.await(eq(page), any(Runnable.class),
                     any(Runnable.class), anyInt())).thenReturn(detail);
-            BossTaskPausedException failure = assertThrows(BossTaskPausedException.class, boss::execute);
-            assertTrue(failure.getMessage().contains("缺少可核对的岗位标识"));
+            assertEquals(0, boss.execute());
         }
+        assertTrue(progress.stream().anyMatch(message -> message.contains("岗位标识缺失")),
+                "the skip must be reported as a data condition, not as a pause");
+        verify(boss, never()).appendRawJson(anyString());
+        verify(page, never()).context();
+    }
+
+    @Test
+    void consecutiveMissingIdentifiersNeverPauseTheWholeTask() {
+        addCards("card-a", "card-b", "card-c");
+        for (Locator link : cardLinks) when(link.count()).thenReturn(0);
+        JSONObject root = new JSONObject().put("zpData", new JSONObject().put("jobInfo",
+                new JSONObject().put("jobName", "Java实习生")));
+        var detail = new BossJobDetailReader.Detail(root.toString(), root);
+        List<String> progress = new ArrayList<>();
+        boss.setProgressCallback((message, current, total) -> progress.add(message));
+        doReturn(false).when(boss).loadNextJobBatch(anyString(), anyInt());
+
+        try (MockedStatic<BossJobDetailAwaiter> awaited = mockStatic(BossJobDetailAwaiter.class);
+             MockedStatic<PlaywrightUtil> sleeps = mockStatic(PlaywrightUtil.class)) {
+            awaited.when(() -> BossJobDetailAwaiter.await(eq(page), any(Runnable.class),
+                    any(Runnable.class), anyInt())).thenReturn(detail);
+            assertEquals(0, boss.execute());
+        }
+        assertEquals(3, progress.stream().filter(message -> message.contains("岗位标识缺失")).count());
         verify(boss, never()).appendRawJson(anyString());
         verify(page, never()).context();
     }

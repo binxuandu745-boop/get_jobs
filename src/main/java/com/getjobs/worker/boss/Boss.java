@@ -97,6 +97,8 @@ public class Boss {
     private int detailResponseTimeoutMs = 60_000;
     private int previewInspectedCount;
     private int previewMatchedCount;
+    /** Cards skipped because neither the card nor its detail carried a usable job identity. */
+    private int unidentifiedCardSkips;
     private Set<String> blackCompanies;
     private Set<String> blackRecruiters;
     private Set<String> blackJobs;
@@ -169,6 +171,7 @@ public class Boss {
                     : "自动截图已关闭：使用原岗位详情数据筛选", null, null);
         }
         taskVisits.reset();
+        unidentifiedCardSkips = 0;
         for (String cityCode : config.getCityCode()) {
             if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
                 progressCallback.accept("用户取消投递", 0, 0);
@@ -369,7 +372,10 @@ public class Boss {
                             .getJSONObject("jobInfo").optString("encryptId", null);
                     returnedId = BossTaskVisitLedger.identityOf(returnedId);
                     if (returnedId == null) {
-                        throw BossTaskPausedException.detailsUnavailable("当前卡片及详情均缺少可核对的岗位标识");
+                        // A short or promoted card can have no detail link and no usable identity.
+                        // That is a data condition, not a challenge: skip this card and keep the run.
+                        skipCardWithoutIdentity(keyword, i, detail.root());
+                        continue;
                     }
                     if (!Boolean.TRUE.equals(config.getDebugger())) {
                         // Legacy cards without a stable href must still match the visible detail
@@ -512,6 +518,36 @@ public class Boss {
         Locator links = card.locator("a[href*='/job_detail/']");
         if (links.count() == 0) return null;
         return BossTaskVisitLedger.identityOf(links.first().getAttribute("href"));
+    }
+
+    /**
+     * A card whose detail response carries no usable identity is skipped, never guessed and never
+     * recorded: no detail processing, no communication. This is a page data condition (short or
+     * promoted cards), so it must not stop the whole task; real challenges stay with the page checks.
+     */
+    private void skipCardWithoutIdentity(String keyword, int cardIndex, JSONObject detailRoot) {
+        String reason = identityProblem(detailRoot);
+        unidentifiedCardSkips++;
+        log.info("Boss 跳过岗位 [岗位标识缺失]：{}（关键词 {}，卡片序号 {}，本任务第 {} 个）；未记录、未沟通",
+                reason, keyword, cardIndex + 1, unidentifiedCardSkips);
+        if (progressCallback != null) {
+            progressCallback.accept("跳过岗位标识缺失的卡片：" + reason, null, null);
+        }
+        if (unidentifiedCardSkips == 3) {
+            log.warn("本任务已跳过 3 个缺少岗位标识的卡片，可能是页面结构变化；任务继续，风控判断仍由页面检查负责");
+        }
+    }
+
+    /** Names the missing identifier without echoing any value from the page or the response. */
+    private static String identityProblem(JSONObject detailRoot) {
+        JSONObject data = detailRoot == null ? null : detailRoot.optJSONObject("zpData");
+        JSONObject job = data == null ? null : data.optJSONObject("jobInfo");
+        if (job == null) return "详情响应缺少岗位信息";
+        Object raw = job.opt("encryptId");
+        if (raw == null) return "详情响应的岗位标识为空";
+        if (!(raw instanceof String value)) return "详情响应的岗位标识类型异常";
+        if (value.isBlank()) return "详情响应的岗位标识为空";
+        return "详情响应的岗位标识格式无法核对（长度 " + value.length() + "）";
     }
 
     private String selectedJobId() {
