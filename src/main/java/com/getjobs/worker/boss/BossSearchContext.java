@@ -11,7 +11,7 @@ import java.util.stream.Collectors;
 
 /** Semantic search filters only; tracking, selected job IDs and query ordering are immaterial. */
 public final class BossSearchContext {
-    private static final Set<String> FILTERS = Set.of("city", "query", "jobType", "experience", "salary",
+    private static final Set<String> FILTERS = Set.of("city", "query", "position", "jobType", "experience", "salary",
             "degree", "scale", "industry", "stage");
     private final Map<String, String> filters;
 

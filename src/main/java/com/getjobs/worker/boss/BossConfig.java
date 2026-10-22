@@ -55,6 +55,11 @@ public class BossConfig {
     private String jobType;
 
     /**
+     * 职位方向（Boss position 代码，例如 Java 为 100101）
+     */
+    private String position;
+
+    /**
      * 薪资范围（多选）
      */
     private java.util.List<String> salary;

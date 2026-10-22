@@ -819,6 +819,8 @@ public class Boss {
         }
         List<String> params = new ArrayList<>();
         addParam(params, JobUtils.appendParam("city", cityCode));
+        // 职位方向（position）决定页面预选的岗位分类，例如 Java 为 100101
+        addParam(params, JobUtils.appendParam("position", config.getPosition()));
         addParam(params, JobUtils.appendParam("jobType", config.getJobType()));
         addParam(params, JobUtils.appendListParam("salary", config.getSalary()));
         addParam(params, JobUtils.appendListParam("experience", config.getExperience()));

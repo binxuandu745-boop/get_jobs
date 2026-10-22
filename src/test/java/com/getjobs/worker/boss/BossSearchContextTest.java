@@ -31,7 +31,7 @@ class BossSearchContextTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"city=102", "jobType=another-type", "query=Python", "experience=2", "salary=2",
+    @ValueSource(strings = {"city=102", "position=100102", "jobType=another-type", "query=Python", "experience=2", "salary=2",
             "degree=2", "scale=2", "industry=2", "stage=2"})
     void everyMaterialFilterChangeIsDetected(String change) {
         assertFalse(BossSearchContext.fromUrl(BASE + "?city=101&jobType=known-type&query=Java")

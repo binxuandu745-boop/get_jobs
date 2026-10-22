@@ -23,6 +23,7 @@ interface BossConfig {
   cityCode?: string
   industry?: string
   jobType?: string
+  position?: string
   experience?: string
   degree?: string
   salary?: string
@@ -68,6 +69,7 @@ export default function BossPage() {
     cityCode: '',
     industry: '',
     jobType: '',
+    position: '',
     experience: '',
     degree: '',
     salary: '',
@@ -738,6 +740,17 @@ export default function BossPage() {
                   ))}
                 </Select>
                 <p className="text-xs text-muted-foreground">选择职位类型</p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="position">职位方向</Label>
+                <Input
+                  id="position"
+                  value={config.position || ''}
+                  onChange={(e) => setConfig({ ...config, position: e.target.value })}
+                  placeholder="例如 100101（Java）"
+                />
+                <p className="text-xs text-muted-foreground">Boss 的 position 代码，留空则不添加该筛选；多个用逗号分隔</p>
               </div>
 
               <div className="space-y-2">

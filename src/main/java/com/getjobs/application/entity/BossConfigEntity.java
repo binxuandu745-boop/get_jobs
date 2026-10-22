@@ -25,6 +25,8 @@ public class BossConfigEntity {
     private String industry;
     /** 职位类型（名称或代码，单值或列表，优先取第一项） */
     private String jobType;
+    /** 职位方向（Boss position 代码，如 Java 为 100101；数字代码或逗号列表） */
+    private String position;
     /** 工作经验（名称或代码，支持列表） */
     private String experience;
     /** 学历要求（名称或代码，支持列表） */

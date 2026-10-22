@@ -15,6 +15,7 @@ import com.getjobs.application.mapper.BossConfigMapper;
 import com.getjobs.application.mapper.BossIndustryMapper;
 import com.getjobs.application.mapper.BossOptionMapper;
 import com.getjobs.worker.boss.BossConfig;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -50,6 +51,25 @@ public class BossService {
     private final BlacklistMapper blacklistMapper;
     private final BossJobDataMapper bossJobDataMapper;
     private final javax.sql.DataSource dataSource;
+
+    /** Older databases lack boss_config.position; adding it here keeps every later update working. */
+    @PostConstruct
+    void ensureBossConfigPositionColumn() {
+        try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
+            Set<String> columns = new java.util.HashSet<>();
+            try (ResultSet rs = stmt.executeQuery("PRAGMA table_info('boss_config')")) {
+                while (rs.next()) {
+                    String name = rs.getString("name");
+                    if (name != null) columns.add(name.toLowerCase(java.util.Locale.ROOT));
+                }
+            }
+            if (columns.isEmpty() || columns.contains("position")) return;
+            stmt.execute("ALTER TABLE boss_config ADD COLUMN position TEXT");
+            log.info("已为 boss_config 补充 position 列（职位方向）");
+        } catch (Exception failure) {
+            log.warn("检查或补充 boss_config.position 失败（异常类型：{}）", failure.getClass().getSimpleName());
+        }
+    }
 
     // ==================== Option相关方法 ====================
 
@@ -231,6 +251,7 @@ public class BossService {
         if (partial.getCityCode() != null) existing.setCityCode(partial.getCityCode());
         if (partial.getIndustry() != null) existing.setIndustry(partial.getIndustry());
         if (partial.getJobType() != null) existing.setJobType(partial.getJobType());
+        if (partial.getPosition() != null) existing.setPosition(partial.getPosition());
         if (partial.getExperience() != null) existing.setExperience(partial.getExperience());
         if (partial.getDegree() != null) existing.setDegree(partial.getDegree());
         if (partial.getSalary() != null) existing.setSalary(partial.getSalary());
@@ -293,6 +314,8 @@ public class BossService {
 
         // A selected internship must remain 1902 even when an older database lacks its dictionary row.
         config.setJobType(normalizeJobTypeToCode(entity.getJobType()));
+        // 职位方向只接受数字代码，避免把名称或其他字段误当成筛选条件拼进搜索地址
+        config.setPosition(normalizePositionCodes(entity.getPosition()));
         // 薪资：名称或代码 -> 统一为代码列表（用于URL逗号拼接）
         config.setSalary(toCodes("salary", parseListString(entity.getSalary())));
 
@@ -332,9 +355,27 @@ public class BossService {
         return option.getCode();
     }
 
+    /**
+     * Accepts one Boss position code or a comma-separated list of them. Anything else is dropped
+     * instead of being written into the search URL, so a stray name cannot silently filter nothing.
+     */
+    static String normalizePositionCodes(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        List<String> codes = new ArrayList<>();
+        for (String part : raw.split(",")) {
+            String code = part.trim();
+            if (code.isEmpty()) continue;
+            if (!code.matches("\\d{1,12}")) {
+                log.warn("忽略无效的职位方向取值：只接受 Boss 的 position 数字代码");
+                return null;
+            }
+            if (!codes.contains(code)) codes.add(code);
+        }
+        return codes.isEmpty() ? null : String.join(",", codes);
+    }
+
     /** Store the single display name while retaining the verified internship code independently of old dictionaries. */
-    public String normalizeJobTypeToName(String raw) {
-        String code = normalizeJobTypeToCode(raw);
+    public String normalizeJobTypeToName(String raw) {        String code = normalizeJobTypeToCode(raw);
         if ("0".equals(code)) return "不限";
         if ("1902".equals(code)) return "实习";
         BossOptionEntity option = getOptionByTypeAndCode("jobType", code);
