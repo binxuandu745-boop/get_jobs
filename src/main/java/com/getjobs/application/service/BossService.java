@@ -2,6 +2,7 @@ package com.getjobs.application.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.toolkit.StringUtils;
 import com.getjobs.application.entity.BlacklistEntity;
 import com.getjobs.application.entity.BossConfigEntity;
@@ -17,6 +18,7 @@ import com.getjobs.worker.boss.BossConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -55,6 +57,7 @@ public class BossService {
      * 根据类型获取选项列表
      */
     public List<BossOptionEntity> getOptionsByType(String type) {
+        if ("jobType".equals(type)) ensureInternshipJobTypeOption();
         // 确保数据库存在『不限』选项（code=0），并置顶显示
         // city 与 industry 都需要此默认项
         QueryWrapper<BossOptionEntity> checkWrapper = new QueryWrapper<>();
@@ -288,21 +291,8 @@ public class BossService {
         config.setScale(toCodes("scale", parseListString(entity.getScale())));
         config.setStage(toCodes("stage", parseListString(entity.getStage())));
 
-        // 职位类型：统一转换为代码，若为列表取第一个；为空时使用不限代码
-        List<String> jobTypeCodes = toCodes("jobType", parseListString(entity.getJobType()));
-        String jobTypeCode = null;
-        if (!jobTypeCodes.isEmpty()) {
-            jobTypeCode = jobTypeCodes.get(0);
-        } else if (entity.getJobType() != null && !entity.getJobType().trim().isEmpty()) {
-            BossOptionEntity byCode = getOptionByTypeAndCode("jobType", entity.getJobType());
-            jobTypeCode = byCode != null && byCode.getCode() != null
-                    ? byCode.getCode()
-                    : getCodeByTypeAndName("jobType", entity.getJobType());
-        }
-        if (jobTypeCode == null || jobTypeCode.trim().isEmpty()) {
-            jobTypeCode = com.getjobs.worker.utils.Constant.UNLIMITED_CODE;
-        }
-        config.setJobType(jobTypeCode);
+        // A selected internship must remain 1902 even when an older database lacks its dictionary row.
+        config.setJobType(normalizeJobTypeToCode(entity.getJobType()));
         // 薪资：名称或代码 -> 统一为代码列表（用于URL逗号拼接）
         config.setSalary(toCodes("salary", parseListString(entity.getSalary())));
 
@@ -319,6 +309,94 @@ public class BossService {
 
         log.info("已从 boss_config 加载Boss配置，并完成括号列表解析");
         return config;
+    }
+
+    /** Resolve exactly one job type without silently replacing an unknown value with unrestricted search. */
+    public String normalizeJobTypeToCode(String raw) {
+        String value = singleJobTypeValue(raw);
+        if (value.isEmpty() || "不限".equals(value) || "0".equals(value)) return "0";
+        if ("实习".equals(value) || "1902".equals(value)) {
+            checkInternshipJobTypeDictionary();
+            return "1902";
+        }
+        BossOptionEntity option = getOptionByTypeAndCode("jobType", value);
+        if (option == null) {
+            QueryWrapper<BossOptionEntity> query = new QueryWrapper<>();
+            query.eq("type", "jobType").eq("name", value);
+            option = bossOptionMapper.selectOne(query);
+        }
+        if (option == null || option.getCode() == null || option.getCode().isBlank()) {
+            throw new IllegalArgumentException("职位类型无效，请选择一个已知职位类型");
+        }
+        requireConsistentInternshipOption(option);
+        return option.getCode();
+    }
+
+    /** Store the single display name while retaining the verified internship code independently of old dictionaries. */
+    public String normalizeJobTypeToName(String raw) {
+        String code = normalizeJobTypeToCode(raw);
+        if ("0".equals(code)) return "不限";
+        if ("1902".equals(code)) return "实习";
+        BossOptionEntity option = getOptionByTypeAndCode("jobType", code);
+        if (option == null || option.getName() == null || option.getName().isBlank()) {
+            throw new IllegalStateException("职位类型字典缺少有效名称");
+        }
+        requireConsistentInternshipOption(option);
+        return option.getName();
+    }
+
+    /** Serialize dictionary repair within this service so simultaneous management reads do not add duplicates. */
+    private synchronized void ensureInternshipJobTypeOption() {
+        BossOptionEntity existing = checkInternshipJobTypeDictionary();
+        if (existing != null) return;
+        BossOptionEntity internship = new BossOptionEntity();
+        internship.setType("jobType");
+        internship.setName("实习");
+        internship.setCode("1902");
+        internship.setCreatedAt(LocalDateTime.now());
+        internship.setUpdatedAt(internship.getCreatedAt());
+        if (bossOptionMapper.insert(internship) <= 0) {
+            throw new IllegalStateException("实习职位类型字典补充失败");
+        }
+    }
+
+    private BossOptionEntity checkInternshipJobTypeDictionary() {
+        BossOptionEntity byCode = getOptionByTypeAndCode("jobType", "1902");
+        if (byCode != null) requireConsistentInternshipOption(byCode);
+        QueryWrapper<BossOptionEntity> byNameQuery = new QueryWrapper<>();
+        byNameQuery.eq("type", "jobType").eq("name", "实习");
+        BossOptionEntity byName = bossOptionMapper.selectOne(byNameQuery);
+        if (byName != null) requireConsistentInternshipOption(byName);
+        return byCode;
+    }
+
+    private static void requireConsistentInternshipOption(BossOptionEntity option) {
+        if (("1902".equals(option.getCode()) || "实习".equals(option.getName()))
+                && !("1902".equals(option.getCode()) && "实习".equals(option.getName()))) {
+            throw new IllegalStateException("实习职位类型字典存在冲突，请核对1902与实习的对应关系");
+        }
+    }
+
+    private static String singleJobTypeValue(String raw) {
+        if (raw == null || raw.isBlank()) return "";
+        String value = raw.trim();
+        if (value.startsWith("[") || value.endsWith("]")) {
+            if (!value.startsWith("[") || !value.endsWith("]")) {
+                throw new IllegalArgumentException("职位类型须为单一选项");
+            }
+            value = value.substring(1, value.length() - 1).trim();
+        }
+        if (value.contains(",") || value.contains("，") || value.contains("[") || value.contains("]")) {
+            throw new IllegalArgumentException("职位类型须为单一选项");
+        }
+        if (value.startsWith("\"") || value.endsWith("\"")) {
+            if (value.length() < 2 || !value.startsWith("\"") || !value.endsWith("\"")) {
+                throw new IllegalArgumentException("职位类型格式无效");
+            }
+            value = value.substring(1, value.length() - 1).trim();
+        }
+        if (value.contains("\"")) throw new IllegalArgumentException("职位类型格式无效");
+        return value;
     }
 
     /**
@@ -610,6 +688,47 @@ public class BossService {
         bossJobDataMapper.insert(entity);
     }
 
+    /** Refreshes image-derived fields, including explicit missing values, without replacing website metadata. */
+    @Transactional
+    public void recordScreenshotObservation(BossJobDataEntity entity) {
+        if (entity == null || entity.getEncryptId() == null || entity.getEncryptId().isBlank()) {
+            throw new IllegalArgumentException("截图岗位记录缺少可核对的岗位标识");
+        }
+        QueryWrapper<BossJobDataEntity> query = new QueryWrapper<>();
+        query.eq("encrypt_id", entity.getEncryptId());
+        if (entity.getEncryptUserId() != null && !entity.getEncryptUserId().isBlank()) {
+            query.eq("encrypt_user_id", entity.getEncryptUserId());
+        }
+        query.last("LIMIT 1");
+        BossJobDataEntity existing = bossJobDataMapper.selectOne(query);
+        LocalDateTime now = LocalDateTime.now();
+        entity.setExperience(null);
+        entity.setUpdatedAt(now);
+        if (existing == null) {
+            entity.setCreatedAt(now);
+            if (bossJobDataMapper.insert(entity) <= 0) {
+                throw new IllegalStateException("截图岗位记录未能保存");
+            }
+            return;
+        }
+        if (existing.getId() == null) throw new IllegalStateException("已有截图岗位记录缺少主键");
+        String status = "已投递".equals(existing.getDeliveryStatus()) ? "已投递" : entity.getDeliveryStatus();
+        LambdaUpdateWrapper<BossJobDataEntity> update = new LambdaUpdateWrapper<>();
+        update.eq(BossJobDataEntity::getId, existing.getId())
+                .set(BossJobDataEntity::getJobName, entity.getJobName())
+                .set(BossJobDataEntity::getSalary, entity.getSalary())
+                .set(BossJobDataEntity::getLocation, entity.getLocation())
+                .set(BossJobDataEntity::getDegree, entity.getDegree())
+                .set(BossJobDataEntity::getJobDescription, entity.getJobDescription())
+                .set(BossJobDataEntity::getCompanyName, entity.getCompanyName())
+                .set(BossJobDataEntity::getExperience, null)
+                .set(BossJobDataEntity::getDeliveryStatus, status)
+                .set(BossJobDataEntity::getUpdatedAt, now);
+        if (bossJobDataMapper.update(null, update) <= 0) {
+            throw new IllegalStateException("截图岗位记录未能更新");
+        }
+    }
+
     /**
      * 更新投递状态（WHERE encrypt_id = ? AND encrypt_user_id = ?）
      */
@@ -625,6 +744,19 @@ public class BossService {
             uw.eq("encrypt_user_id", encryptUserId);
         }
         bossJobDataMapper.update(update, uw);
+    }
+
+    /** Reclassifies preview records without overwriting already-sent application states. */
+    public void markPendingJobFiltered(String encryptId, String encryptUserId) {
+        if (encryptId == null) return;
+        BossJobDataEntity update = new BossJobDataEntity();
+        update.setDeliveryStatus("已过滤");
+        update.setUpdatedAt(LocalDateTime.now());
+        com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<BossJobDataEntity> where =
+                new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<>();
+        where.eq("encrypt_id", encryptId).eq("delivery_status", "未投递");
+        if (encryptUserId != null) where.eq("encrypt_user_id", encryptUserId);
+        bossJobDataMapper.update(update, where);
     }
 
     // ==================== 投递分析（Dashboard）相关方法 ====================

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.getjobs.application.entity.CookieEntity;
 import com.getjobs.application.service.CookieService;
+import com.getjobs.application.service.BrowserModePreferenceStore;
 import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.Cookie;
 import com.microsoft.playwright.options.WaitUntilState;
@@ -13,6 +14,7 @@ import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -22,18 +24,22 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * Playwright管理器
@@ -107,8 +113,10 @@ public class PlaywrightManager {
     // 外面包多少层 try/catch 都没用，实测把初始化卡了两分钟以上还在等。
     private static final double LOAD_STATE_TIMEOUT = 10_000;
 
-    // Boss 登录态 Cookie：出现任意一个即视为已登录
-    private static final Set<String> BOSS_LOGIN_COOKIES = Set.of("bst", "wt2", "zp_at", "geek_zp_token");
+    private volatile BossLoginProbe.Result bossLoginResult =
+            BossLoginProbe.unknown("尚未确认浏览器登录状态", "pending");
+    private volatile LiepinLoginProbe.Result liepinLoginResult =
+            new LiepinLoginProbe.Result(LiepinLoginProbe.State.UNKNOWN, "尚未确认猎聘登录状态");
 
     // 持久化上下文的用户数据目录，登录态直接落在这里
     private static final Path USER_DATA_DIR = Paths.get(System.getProperty("user.dir"), "browser-data");
@@ -135,6 +143,144 @@ public class PlaywrightManager {
 
     @Autowired
     private CookieService cookieService;
+
+    @Value("${getjobs.browser.channel:chrome}")
+    private String browserChannel;
+
+    @Value("${getjobs.browser.boss-only:false}")
+    private boolean bossOnly;
+
+    @Value("${getjobs.browser.platform-mode:}")
+    private String platformMode;
+
+    @Autowired
+    private BrowserModePreferenceStore modePreferenceStore;
+
+    private volatile BrowserPlatformMode selectedMode;
+    private volatile boolean switchingMode;
+    private final Object modeSelectionLock = new Object();
+    private final Object playwrightSubmissionLock = new Object();
+    private final Set<String> taskReservations = new HashSet<>();
+
+    private BrowserPlatformMode currentMode() {
+        if (selectedMode != null) return selectedMode;
+        synchronized (modeSelectionLock) {
+            if (selectedMode == null) {
+                String saved = modePreferenceStore == null ? null : modePreferenceStore.readSavedMode();
+                selectedMode = BrowserPlatformMode.resolve(saved == null ? platformMode : saved, bossOnly);
+            }
+            return selectedMode;
+        }
+    }
+
+    public String getBrowserPlatformMode() {
+        return currentMode().value();
+    }
+
+    public boolean isPlatformEnabled(String platform) {
+        return currentMode().enables(platform);
+    }
+
+    public boolean isSwitchingMode() {
+        return switchingMode;
+    }
+
+    public boolean hasPlatformTaskReservations() {
+        synchronized (playwrightSubmissionLock) {
+            return !taskReservations.isEmpty();
+        }
+    }
+
+    public boolean canSwitchPlatformMode(BooleanSupplier taskRunning) {
+        synchronized (playwrightSubmissionLock) {
+            return !switchingMode && taskReservations.isEmpty() && !isPlaywrightBusy()
+                    && (taskRunning == null || !taskRunning.getAsBoolean());
+        }
+    }
+
+    /** Reserve an API-started task before scheduling it, closing the asynchronous-start race. */
+    public CompletableFuture<Void> startPlatformTask(String platform, Runnable task) {
+        synchronized (playwrightSubmissionLock) {
+            if (switchingMode || taskReservations.contains(platform)) throw new BrowserModeSwitchBusyException();
+            if (!isPlatformEnabled(platform)) throw new IllegalArgumentException("当前模式未启用该平台");
+            taskReservations.add(platform);
+            try {
+                return CompletableFuture.runAsync(() -> {
+                    try {
+                        task.run();
+                    } finally {
+                        synchronized (playwrightSubmissionLock) {
+                            taskReservations.remove(platform);
+                        }
+                    }
+                });
+            } catch (RuntimeException failure) {
+                taskReservations.remove(platform);
+                throw failure;
+            }
+        }
+    }
+
+    /** Explicit user action only: persist selection and reopen only this app's browser/profile. */
+    public boolean switchPlatformMode(String requested, BooleanSupplier taskRunning) {
+        if (requested == null || requested.isBlank()) throw new IllegalArgumentException("请选择浏览器模式");
+        BrowserPlatformMode target = BrowserPlatformMode.resolve(requested, false);
+        Future<Boolean> operation;
+        synchronized (playwrightSubmissionLock) {
+            if (!canSwitchPlatformMode(taskRunning)) throw new BrowserModeSwitchBusyException();
+            if (target == currentMode() && isInitialized()) return false;
+            switchingMode = true;
+            playwrightQueueDepth.incrementAndGet();
+            try {
+                operation = playwrightExecutor.submit(() -> {
+                    boolean saved = false;
+                    try {
+                        if (modePreferenceStore == null) throw new IllegalStateException("模式配置存储不可用");
+                        modePreferenceStore.save(target.value());
+                        saved = true;
+                        closeForModeSwitch();
+                        selectedMode = target;
+                        initializeSelectedMode();
+                        return true;
+                    } catch (RuntimeException failure) {
+                        if (saved) {
+                            selectedMode = target;
+                            try { closeForModeSwitch(); } catch (RuntimeException ignored) { }
+                        }
+                        throw new IllegalStateException(saved
+                                ? "模式选择已保存，但浏览器初始化失败；请检查后重试。未启动投递"
+                                : "模式选择保存失败，原浏览器未切换；请检查本地配置存储");
+                    } finally {
+                        synchronized (playwrightSubmissionLock) {
+                            switchingMode = false;
+                            playwrightQueueDepth.decrementAndGet();
+                        }
+                    }
+                });
+            } catch (RuntimeException failure) {
+                switchingMode = false;
+                playwrightQueueDepth.decrementAndGet();
+                throw new IllegalStateException("无法提交模式切换，请稍后重试");
+            }
+        }
+        try {
+            return operation.get();
+        } catch (ExecutionException failure) {
+            throw toRuntime(failure.getCause());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            // The already-submitted switch may finish; a client must re-read status, not retry blindly.
+            throw new IllegalStateException("模式切换请求等待被中断，请刷新状态确认结果；不要重复提交");
+        }
+    }
+
+    void initializeSelectedMode() {
+        initInternal();
+    }
+
+    void closeForModeSwitch() {
+        closeBrowserInternal();
+    }
 
     // ------------------------------------------------------------------
     // Playwright 单线程调度
@@ -174,15 +320,25 @@ public class PlaywrightManager {
                 throw toRuntime(e);
             }
         }
-        playwrightQueueDepth.incrementAndGet();
+        Future<T> operation;
+        synchronized (playwrightSubmissionLock) {
+            if (switchingMode) throw new BrowserModeSwitchBusyException();
+            playwrightQueueDepth.incrementAndGet();
+            try {
+                operation = playwrightExecutor.submit(() -> {
+                    try {
+                        return task.call();
+                    } finally {
+                        playwrightQueueDepth.decrementAndGet();
+                    }
+                });
+            } catch (RuntimeException failure) {
+                playwrightQueueDepth.decrementAndGet();
+                throw failure;
+            }
+        }
         try {
-            return playwrightExecutor.submit(() -> {
-                try {
-                    return task.call();
-                } finally {
-                    playwrightQueueDepth.decrementAndGet();
-                }
-            }).get();
+            return operation.get();
         } catch (ExecutionException e) {
             throw toRuntime(e.getCause());
         } catch (InterruptedException e) {
@@ -208,20 +364,25 @@ public class PlaywrightManager {
      * @return 是否真的提交了任务
      */
     public boolean tryRunOnPlaywright(Runnable task) {
-        if (playwrightQueueDepth.get() > 0) {
-            return false;
-        }
-        playwrightQueueDepth.incrementAndGet();
-        playwrightExecutor.execute(() -> {
+        synchronized (playwrightSubmissionLock) {
+            if (switchingMode || playwrightQueueDepth.get() > 0) return false;
+            playwrightQueueDepth.incrementAndGet();
             try {
-                task.run();
-            } catch (Exception e) {
-                log.debug("Playwright后台任务异常: {}", e.getMessage());
-            } finally {
+                playwrightExecutor.execute(() -> {
+                    try {
+                        task.run();
+                    } catch (Exception e) {
+                        log.debug("Playwright后台任务异常: {}", e.getMessage());
+                    } finally {
+                        playwrightQueueDepth.decrementAndGet();
+                    }
+                });
+            } catch (RuntimeException failure) {
                 playwrightQueueDepth.decrementAndGet();
+                return false;
             }
-        });
-        return true;
+            return true;
+        }
     }
 
     /**
@@ -288,6 +449,8 @@ public class PlaywrightManager {
         if (isInitialized()) {
             return;
         }
+        // Resolve before launching anything; invalid configuration must not enable extra platforms.
+        BrowserPlatformMode mode = currentMode();
         log.info("========================================");
         log.info("  初始化浏览器自动化引擎");
         log.info("========================================");
@@ -304,7 +467,7 @@ public class PlaywrightManager {
             // 而不是 launch() + newContext()。登录态直接落盘到 USER_DATA_DIR。
             context = playwright.chromium().launchPersistentContext(USER_DATA_DIR,
                     new BrowserType.LaunchPersistentContextOptions()
-                            .setChannel("chrome")   // 用本机真实 Chrome，而不是 Chromium
+                            .setChannel(browserChannel) // 使用本机已安装的 Chrome 通道
                             .setHeadless(false)     // 无头必被检测
                             .setSlowMo(50)          // 放慢操作速度，便于调试
                             .setViewportSize(null)  // 不锁视口，用窗口实际大小
@@ -336,14 +499,14 @@ public class PlaywrightManager {
             // 浏览器一旦关闭（手动关窗口 / Chrome 崩溃）立刻置位，
             // 让 isInitialized() 变 false，后续操作走重新初始化而不是一路 TargetClosedError
             context.onClose(closed -> {
-                browserClosed = true;
+                markBrowserClosed();
                 log.warn("检测到浏览器已关闭，下次操作会自动重新初始化");
             });
             log.info("✓ Chrome已启动（持久化上下文: {}）", USER_DATA_DIR);
             log.info("✓ BrowserContext已创建（所有平台共享）");
 
-            // 顺序创建所有Page（避免并发创建Page导致的竞态条件）
-            log.info("开始创建所有平台的Page...");
+            // Only create pages enabled by the selected mode, on the same Playwright thread.
+            log.info("开始创建平台页面（platformMode={}）...", mode);
 
             // 持久化上下文自带的那个启动标签页不能复用！
             // 复用它会出现：标签页永远停在加载中（左上角一直转圈），而 page.evaluate /
@@ -352,23 +515,9 @@ public class PlaywrightManager {
             // 同一个浏览器里新开的标签页则完全正常，所以这里一律新建，最后把启动页关掉。
             List<Page> startupPages = new ArrayList<>(context.pages());
 
-            bossPage = context.newPage();
-            bossPage.setDefaultTimeout(DEFAULT_TIMEOUT);
-            log.info("✓ Boss Page已创建");
+            createPlatformPages(mode);
 
-            liepinPage = context.newPage();
-            liepinPage.setDefaultTimeout(DEFAULT_TIMEOUT);
-            log.info("✓ 猎聘 Page已创建");
-
-            job51Page = context.newPage();
-            job51Page.setDefaultTimeout(DEFAULT_TIMEOUT);
-            log.info("✓ 51job Page已创建");
-
-            zhilianPage = context.newPage();
-            zhilianPage.setDefaultTimeout(DEFAULT_TIMEOUT);
-            log.info("✓ 智联招聘 Page已创建");
-
-            // 四个业务页都建好了，把持久化上下文自带的启动空白页关掉
+            // Selected business pages are ready; close the initial context-owned startup pages.
             for (Page startup : startupPages) {
                 try {
                     startup.close();
@@ -382,18 +531,31 @@ public class PlaywrightManager {
 
             // 各平台初始化必须串行：它们共享同一个 BrowserContext 和同一条 Playwright 连接，
             // 原来用 4 个 ForkJoinPool 线程并发跑，会互相打断导航（net::ERR_ABORTED）
-            log.info("开始依次初始化所有平台...");
-            setupBossPlatform();
-            setupLiepinPlatform();
-            setup51jobPlatform();
-            setupZhilianPlatform();
+            log.info("开始依次初始化已启用的平台...");
+            if (mode.enables("boss")) setupBossPlatform();
+            if (mode.enables("liepin")) setupLiepinPlatform();
+            if (mode.enables("51job")) setup51jobPlatform();
+            if (mode.enables("zhilian")) setupZhilianPlatform();
 
-            log.info("✓ 浏览器自动化引擎初始化完成（所有平台已依次启动）");
+            log.info("✓ 浏览器自动化引擎初始化完成（platformMode={}）", mode);
             log.info("========================================");
         } catch (Exception e) {
             log.error("✗ 浏览器自动化引擎初始化失败", e);
             throw new RuntimeException("Playwright初始化失败", e);
         }
+    }
+
+    private void createPlatformPages(BrowserPlatformMode mode) {
+        bossPage = mode.enables("boss") ? createPlatformPage() : null;
+        liepinPage = mode.enables("liepin") ? createPlatformPage() : null;
+        job51Page = mode.enables("51job") ? createPlatformPage() : null;
+        zhilianPage = mode.enables("zhilian") ? createPlatformPage() : null;
+    }
+
+    private Page createPlatformPage() {
+        Page page = context.newPage();
+        page.setDefaultTimeout(DEFAULT_TIMEOUT);
+        return page;
     }
 
     /**
@@ -492,25 +654,9 @@ public class PlaywrightManager {
      */
     private void setupBossPlatform() {
         log.info("开始初始化Boss直聘平台...");
-        // 尝试从数据库加载Boss平台Cookie到上下文
-        try {
-            CookieEntity cookieEntity = cookieService.getCookieByPlatform("boss");
-            if (cookieEntity != null && cookieEntity.getCookieValue() != null && !cookieEntity.getCookieValue().isBlank()) {
-                String cookieStr = cookieEntity.getCookieValue();
-                List<Cookie> cookies = filterCookiesByDomain(parseCookiesFromString(cookieStr), BOSS_DOMAIN);
-
-                if (!cookies.isEmpty()) {
-                    context.addCookies(cookies);
-                    log.info("已从数据库加载Boss Cookie并注入浏览器上下文，共 {} 条", cookies.size());
-                } else {
-                    log.warn("解析Cookie失败，未能加载任何Cookie");
-                }
-            } else {
-                log.info("数据库未找到Boss Cookie或值为空，跳过Cookie注入");
-            }
-        } catch (Exception e) {
-            log.warn("从数据库加载Boss Cookie失败: {}", e.getMessage());
-        }
+        // Persisted Chrome profile is the authority. Never overwrite it with an old DB snapshot.
+        // Existing DB records are retained as backups, not injected into the live browser.
+        log.info("使用持久化浏览器目录恢复Boss登录；不注入数据库旧Cookie");
 
         // 导航到Boss直聘首页（带重试机制）
         int maxRetries = 3;
@@ -564,7 +710,7 @@ public class PlaywrightManager {
             log.warn("Boss直聘页面导航失败: {}", e.getMessage());
         }
         // 初始化登录状态并通知（如果有SSE连接会立即推送）
-        setLoginStatus("boss", checkIfLoggedIn());
+        applyBossLoginResult(BossLoginProbe.awaitKnown(bossPage, 16, 250));
         // 设置登录状态监控
         setupLoginMonitoring(bossPage);
     }
@@ -572,48 +718,54 @@ public class PlaywrightManager {
     /**
      * 检查Boss是否已登录
      */
-    private boolean checkIfLoggedIn() {
-        // 最可靠的信号是登录态 Cookie：不受页面渲染、跳转、加载速度影响。
-        // DOM 探测（头像、登录入口）只作兜底 —— 页面一慢就会误判成未登录，
-        // 而 /api/boss/start 是拿这个结果做准入的，误判会直接导致"请先登录"。
-        try {
-            for (Cookie cookie : context.cookies(BOSS_URL)) {
-                if (BOSS_LOGIN_COOKIES.contains(cookie.name)
-                        && cookie.value != null && !cookie.value.isBlank()) {
-                    return true;
-                }
-            }
-        } catch (Exception ignored) {}
+    public String getBossLoginState() {
+        return browserClosed ? BossLoginProbe.State.UNKNOWN.name() : bossLoginResult.state().name();
+    }
 
-        // 更稳健的登录判断：优先检测用户头像/昵称是否可见；备用检测登录入口是否可见且包含“登录”文本
-        try {
-            Locator userLabel = bossPage.locator("li.nav-figure span.label-text").first();
-            if (isVisibleQuick(userLabel)) {
-                return true;
-            }
-        } catch (Exception ignored) {}
+    public String getBossLoginMessage() {
+        return browserClosed ? "助手浏览器已关闭" : bossLoginResult.message();
+    }
 
-        try {
-            // 有些版本仅展示头像入口，无 label-text
-            Locator navFigure = bossPage.locator("li.nav-figure").first();
-            if (isVisibleQuick(navFigure)) {
-                return true;
-            }
-        } catch (Exception ignored) {}
+    /** Read-only refresh used before a task, not a navigation or login action. */
+    public boolean refreshBossLoginStatus() {
+        if (!isPlatformEnabled("boss") || bossPage == null || !isInitialized()) return false;
+        return callOnPlaywright(() -> {
+            selectAuthenticatedBossPage();
+            applyBossLoginResult(BossLoginProbe.awaitKnown(bossPage, 16, 250));
+            return bossLoginResult.state() == BossLoginProbe.State.LOGGED_IN;
+        });
+    }
 
-        try {
-            // 未登录时通常有“登录/注册”入口或按钮容器
-            Locator loginAnchor = bossPage.locator("li.nav-sign a, .btns").first();
-            if (isVisibleQuick(loginAnchor)) {
-                String text = loginAnchor.textContent(new Locator.TextContentOptions().setTimeout(LOCATOR_PROBE_TIMEOUT));
-                if (text != null && text.contains("登录")) {
-                    return false;
-                }
+    /** Recognize a login completed in another tab of this same app-owned profile. */
+    private void selectAuthenticatedBossPage() {
+        if (context == null || browserClosed) return;
+        if (BossLoginProbe.detect(bossPage).state() == BossLoginProbe.State.LOGGED_IN) return;
+        for (Page candidate : context.pages()) {
+            if (candidate != bossPage
+                    && BossLoginProbe.detect(candidate).state() == BossLoginProbe.State.LOGGED_IN) {
+                bossPage = candidate;
+                bossPage.setDefaultTimeout(DEFAULT_TIMEOUT);
+                setupLoginMonitoring(bossPage);
+                log.info("已绑定同一助手浏览器中的已登录Boss标签页");
+                return;
             }
-        } catch (Exception ignored) {}
+        }
+    }
 
-        // 无法明确检测到登录特征时，保守返回未登录
-        return false;
+    private void applyBossLoginResult(BossLoginProbe.Result result) {
+        BossLoginProbe.Result previous = bossLoginResult;
+        bossLoginResult = result;
+        if (result.state() == BossLoginProbe.State.LOGGED_IN) {
+            if (!Boolean.TRUE.equals(loginStatus.get("boss"))) onLoginSuccess("boss");
+        } else if (result.state() == BossLoginProbe.State.LOGGED_OUT) {
+            setLoginStatus("boss", false);
+            bossLoginResult = result;
+        }
+        if (!result.equals(previous)) {
+            notifyLoginStatus(new LoginStatusChange("boss",
+                    result.state() == BossLoginProbe.State.LOGGED_IN,
+                    System.currentTimeMillis(), result.state().name(), result.message()));
+        }
     }
 
     /**
@@ -642,7 +794,8 @@ public class PlaywrightManager {
             if (frame == page.mainFrame()) {
                 // 事件回调是在别的调用"进行中"被派发的，此时再去调 Playwright 属于重入，
                 // 会打断正在进行的导航。所以除了暂停标志，还要避开前台任务运行期。
-                if (!bossMonitoringPaused && !isPlaywrightBusy()) {
+                if (page == bossPage && !browserClosed && isPlatformEnabled("boss")
+                        && !bossMonitoringPaused && !isPlaywrightBusy()) {
                     checkLoginStatus(page, "boss");
                 }
             }
@@ -652,30 +805,13 @@ public class PlaywrightManager {
     }
 
     /**
-     * 设置猎聘平台（加载Cookie、导航、监控）
+     * 设置猎聘平台（复用持久化登录状态、导航、只读监控）
      */
     private void setupLiepinPlatform() {
         log.info("开始初始化猎聘平台...");
 
-        // 尝试从数据库加载猎聘平台Cookie到上下文
-        try {
-            CookieEntity cookieEntity = cookieService.getCookieByPlatform("liepin");
-            if (cookieEntity != null && cookieEntity.getCookieValue() != null && !cookieEntity.getCookieValue().isBlank()) {
-                String cookieStr = cookieEntity.getCookieValue();
-                List<Cookie> cookies = filterCookiesByDomain(parseCookiesFromString(cookieStr), LIEPIN_DOMAIN);
-
-                if (!cookies.isEmpty()) {
-                    context.addCookies(cookies);
-                    log.info("已从数据库加载猎聘 Cookie并注入浏览器上下文，共 {} 条", cookies.size());
-                } else {
-                    log.warn("解析猎聘Cookie失败，未能加载任何Cookie");
-                }
-            } else {
-                log.info("数据库未找到猎聘Cookie或值为空，跳过Cookie注入");
-            }
-        } catch (Exception e) {
-            log.warn("从数据库加载猎聘Cookie失败: {}", e.getMessage());
-        }
+        // Use the existing persistent profile; stale database snapshots must not overwrite it.
+        // Existing saved records are kept unchanged for backup compatibility.
 
         // 导航到猎聘首页（带重试机制）
         int maxRetries = 3;
@@ -723,92 +859,52 @@ public class PlaywrightManager {
         }
 
         // 初始化登录状态并通知（如果有SSE连接会立即推送）
-        setLoginStatus("liepin", checkIfLiepinLoggedIn());
+        applyLiepinLoginResult(LiepinLoginProbe.inspect(liepinPage));
         // 设置登录状态监控
         setupLiepinLoginMonitoring(liepinPage);
     }
 
-    /**
-     * 检查猎聘是否已登录
-     * 已登录：能找到用户头像 <img class="header-quick-menu-user-photo" ...>
-     * 未登录：能找到 <span id="header-quick-menu-login">登录/注册</span>
-     */
-    private boolean checkIfLiepinLoggedIn() {
-        try {
-            // 先检查“登录/注册”入口是否可见，若可见则明确未登录
-            try {
-                Locator loginEntry = liepinPage.locator(
-                    "#header-quick-menu-login, a[href*='login'], a[data-key='login'], button[data-key='login'], text=/登录|注册/").first();
-                if (isVisibleQuick(loginEntry)) {
-                    log.info("检测到未登录猎聘，保持在登录页或首页等待扫码登录");
-                    // 若不在登录页，则导航到登录页并尝试切换二维码
-                    String currentUrl = null;
-                    try { currentUrl = liepinPage.url(); } catch (Exception ignored) {}
-                    try {
-                        if (currentUrl == null || !currentUrl.contains("/login")) {
-                            liepinPage.navigate("https://www.liepin.com/login");
-                            try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                        }
-                        // 优先点击官方切换二维码的容器
-                        Locator qrSwitch = liepinPage.locator(".switch-type-mask-img-box").first();
-                        if (isVisibleQuick(qrSwitch)) {
-                            qrSwitch.click();
-                            log.info("已切换到猎聘二维码登录页面，等待用户扫码...");
-                        } else {
-                            // 兼容新版页面：图片资源名包含 qrcode-btn，需要点击其父级按钮
-                            Locator qrImg = liepinPage.locator("img[src*='qrcode-btn']").first();
-                            if (qrImg.count() > 0 && isVisibleQuick(qrImg)) {
-                                try {
-                                    // 尝试点击父节点或最近的可点击容器
-                                    qrImg.click();
-                                } catch (Exception ignored) {
-                                    try {
-                                        Locator parentBtn = qrImg.locator("xpath=ancestor::button[1] | xpath=ancestor::*[contains(@class,'btn')][1]").first();
-                                        if (parentBtn.count() > 0 && isVisibleQuick(parentBtn)) {
-                                            parentBtn.click();
-                                        }
-                                    } catch (Exception ignored2) {}
-                                }
-                                log.info("已通过二维码按钮切换到扫码登录状态");
-                            }
-                        }
-                    } catch (Exception e) {
-                        log.debug("猎聘登录页引导/二维码切换失败: {}", e.getMessage());
+    public String getLiepinLoginState() {
+        return browserClosed ? LiepinLoginProbe.State.UNKNOWN.name() : liepinLoginResult.state().name();
+    }
+
+    public String getLiepinLoginMessage() {
+        return browserClosed ? "助手浏览器已关闭" : liepinLoginResult.message();
+    }
+
+    /** Refresh only app-owned pages without navigating, clicking, or starting a task. */
+    public boolean refreshLiepinLoginStatus() {
+        if (!isPlatformEnabled("liepin") || liepinPage == null || !isInitialized()) return false;
+        return callOnPlaywright(() -> {
+            if (LiepinLoginProbe.inspect(liepinPage).state() != LiepinLoginProbe.State.LOGGED_IN) {
+                for (Page candidate : context.pages()) {
+                    if (candidate != liepinPage
+                            && LiepinLoginProbe.inspect(candidate).state() == LiepinLoginProbe.State.LOGGED_IN) {
+                        liepinPage = candidate;
+                        liepinPage.setDefaultTimeout(DEFAULT_TIMEOUT);
+                        setupLiepinLoginMonitoring(liepinPage);
+                        break;
                     }
-                    return false;
                 }
-            } catch (Exception ignored) {}
+            }
+            applyLiepinLoginResult(LiepinLoginProbe.inspect(liepinPage));
+            return liepinLoginResult.state() == LiepinLoginProbe.State.LOGGED_IN;
+        });
+    }
 
-            // 再检查已登录特征：用户信息容器或用户头像是否存在（无需强制可见）
-            try {
-                if (liepinPage.locator("#header-quick-menu-user-info").count() > 0) {
-                    log.debug("猎聘登录检测：存在用户信息容器，判定已登录");
-                    return true;
-                }
-            } catch (Exception ignored) {}
-
-            try {
-                if (liepinPage.locator("img.header-quick-menu-user-photo, .header-quick-menu-user-photo").count() > 0) {
-                    log.debug("猎聘登录检测：存在用户头像元素，判定已登录");
-                    return true;
-                }
-            } catch (Exception ignored) {}
-
-            // 兜底：若不存在登录入口且也未找到明确已登录特征，按已登录处理（避免误判）
-            try {
-                boolean loginEntryExists = liepinPage.locator("#header-quick-menu-login, a[href*='login']").count() > 0;
-                if (!loginEntryExists) {
-                    log.info("猎聘登录检测：未发现登录入口，兜底判定为已登录");
-                    return true;
-                }
-            } catch (Exception ignored) {}
-
-            // 默认未登录
-            log.debug("猎聘登录检测：未匹配到明确特征，判定未登录");
-            return false;
-        } catch (Exception e) {
-            log.debug("猎聘登录检测异常: {}", e.getMessage());
-            return false;
+    private void applyLiepinLoginResult(LiepinLoginProbe.Result result) {
+        LiepinLoginProbe.Result previous = liepinLoginResult;
+        liepinLoginResult = result;
+        if (result.state() == LiepinLoginProbe.State.LOGGED_IN) {
+            if (!Boolean.TRUE.equals(loginStatus.get("liepin"))) onLiepinLoginSuccess();
+        } else if (result.state() == LiepinLoginProbe.State.LOGGED_OUT) {
+            setLoginStatus("liepin", false);
+            liepinLoginResult = result;
+        }
+        if (!result.equals(previous)) {
+            notifyLoginStatus(new LoginStatusChange("liepin",
+                    result.state() == LiepinLoginProbe.State.LOGGED_IN,
+                    System.currentTimeMillis(), result.state().name(), result.message()));
         }
     }
 
@@ -822,7 +918,8 @@ public class PlaywrightManager {
         page.onFrameNavigated(frame -> {
             if (frame == page.mainFrame()) {
                 // 事件回调里再调 Playwright 属于重入，会打断前台任务正在进行的导航
-                if (!liepinMonitoringPaused && !isPlaywrightBusy()) {
+                if (page == liepinPage && !browserClosed && isPlatformEnabled("liepin")
+                        && !liepinMonitoringPaused && !isPlaywrightBusy()) {
                     checkLiepinLoginStatus(page);
                 }
             }
@@ -978,7 +1075,8 @@ public class PlaywrightManager {
         // 监听页面导航事件，检测URL变化
         page.onFrameNavigated(frame -> {
             if (frame == page.mainFrame()) {
-                if (!job51MonitoringPaused && !isPlaywrightBusy()) {
+                if (page == job51Page && !browserClosed && isPlatformEnabled("51job")
+                        && !job51MonitoringPaused && !isPlaywrightBusy()) {
                     check51jobLoginStatus(page);
                 }
             }
@@ -993,6 +1091,7 @@ public class PlaywrightManager {
      * @param page 页面实例
      */
     private void check51jobLoginStatus(Page page) {
+        if (page != job51Page || browserClosed || !isPlatformEnabled("51job")) return;
         try {
             boolean isLoggedIn = checkIf51jobLoggedIn();
             // 如果登录状态发生变化（从未登录变为已登录）
@@ -1024,11 +1123,13 @@ public class PlaywrightManager {
      * 说明：不阻塞初始化主流程，独立线程每秒轮询一次登录状态，最长等待5分钟。
      */
     private void asyncWaitFor51jobLogin() {
+        Page waitingPage = job51Page;
         Thread waitThread = new Thread(() -> {
             try {
                 int maxSeconds = 300; // 最长等待 5 分钟
                 final java.util.concurrent.atomic.AtomicBoolean loggedIn = new java.util.concurrent.atomic.AtomicBoolean(false);
                 for (int i = 0; i < maxSeconds; i++) {
+                    if (browserClosed || waitingPage != job51Page || !isPlatformEnabled("51job")) return;
                     // 这个线程不能直接调 Playwright：它和 playwright-thread 同时读同一条连接，
                     // 会抢走对方的事件，导致投递时报 "Object doesn't exist: response@..."。
                     // 所以检测动作交给专用线程；专用线程正忙（比如在投递）就跳过这一秒。
@@ -1038,7 +1139,8 @@ public class PlaywrightManager {
                     }
                     final int elapsed = i;
                     tryRunOnPlaywright(() -> {
-                        if (job51MonitoringPaused) {
+                        if (job51MonitoringPaused || browserClosed || waitingPage != job51Page
+                                || !isPlatformEnabled("51job")) {
                             return;
                         }
                         try {
@@ -1412,7 +1514,8 @@ public class PlaywrightManager {
         // 监听页面导航事件，检测URL变化
         page.onFrameNavigated(frame -> {
             if (frame == page.mainFrame()) {
-                if (!zhilianMonitoringPaused && !isPlaywrightBusy()) {
+                if (page == zhilianPage && !browserClosed && isPlatformEnabled("zhilian")
+                        && !zhilianMonitoringPaused && !isPlaywrightBusy()) {
                     checkZhilianLoginStatus(page);
                 }
             }
@@ -1427,6 +1530,7 @@ public class PlaywrightManager {
      * @param page 页面实例
      */
     private void checkZhilianLoginStatus(Page page) {
+        if (page != zhilianPage || browserClosed || !isPlatformEnabled("zhilian")) return;
         try {
             boolean isLoggedIn = checkIfZhilianLoggedIn();
             // 如果登录状态发生变化（从未登录变为已登录）
@@ -1581,17 +1685,8 @@ public class PlaywrightManager {
      * @param page 页面实例
      */
     private void checkLiepinLoginStatus(Page page) {
-        try {
-            boolean isLoggedIn = checkIfLiepinLoggedIn();
-            // 如果登录状态发生变化（从未登录变为已登录）
-            Boolean previousStatus = loginStatus.get("liepin");
-            if (isLoggedIn && (previousStatus == null || !previousStatus)) {
-                onLiepinLoginSuccess();
-            }
-        } catch (Exception e) {
-            // 忽略检查过程中的异常，避免影响正常流程
-            log.debug("检查猎聘平台登录状态时发生异常: {}", e.getMessage());
-        }
+        if (!isPlatformEnabled("liepin") || browserClosed || page != liepinPage) return;
+        applyLiepinLoginResult(LiepinLoginProbe.inspect(page));
     }
 
     /**
@@ -1673,16 +1768,11 @@ public class PlaywrightManager {
      * @param platform 平台名称
      */
     private void checkLoginStatus(Page page, String platform) {
+        if (page != bossPage || browserClosed || !isPlatformEnabled("boss")) return;
         try {
-            boolean isLoggedIn = false;
-            if (platform.equals("boss")) {
-                // 统一复用更稳健的Boss登录判断逻辑
-                isLoggedIn = checkIfLoggedIn();
-            }
-            // 如果登录状态发生变化（从未登录变为已登录）
-            Boolean previousStatus = loginStatus.get(platform);
-            if (isLoggedIn && (previousStatus == null || !previousStatus)) {
-                onLoginSuccess(platform);
+            if ("boss".equals(platform)) {
+                selectAuthenticatedBossPage();
+                applyBossLoginResult(BossLoginProbe.detect(bossPage));
             }
         } catch (Exception e) {
             // 忽略检查过程中的异常，避免影响正常流程
@@ -1757,24 +1847,24 @@ public class PlaywrightManager {
      */
     @Scheduled(fixedDelay = 3000)
     public void scheduledLoginCheck() {
-        if (playwright == null || context == null) {
+        if (playwright == null || context == null || browserClosed) {
             return;
         }
         // 必须跑在 Playwright 专用线程上；线程正忙（例如正在投递）就直接跳过这一轮，
         // 否则会打断投递流程里正在进行的导航
         tryRunOnPlaywright(() -> {
             try {
-                if (liepinPage != null && !liepinMonitoringPaused) {
+                if (isPlatformEnabled("liepin") && liepinPage != null && !liepinMonitoringPaused) {
                     checkLiepinLoginStatus(liepinPage);
                 }
                 // 其他平台如需也可启用（保留，但不强制）
-                if (bossPage != null && !bossMonitoringPaused) {
+                if (isPlatformEnabled("boss") && bossPage != null && !bossMonitoringPaused) {
                     checkLoginStatus(bossPage, "boss");
                 }
-                if (job51Page != null && !job51MonitoringPaused) {
+                if (isPlatformEnabled("51job") && job51Page != null && !job51MonitoringPaused) {
                     check51jobLoginStatus(job51Page);
                 }
-                if (zhilianPage != null && !zhilianMonitoringPaused) {
+                if (isPlatformEnabled("zhilian") && zhilianPage != null && !zhilianMonitoringPaused) {
                     checkZhilianLoginStatus(zhilianPage);
                 }
             } catch (Exception e) {
@@ -1805,33 +1895,31 @@ public class PlaywrightManager {
      */
     @PreDestroy
     public void destroy() {
+        runOnPlaywright(this::closeBrowserInternal);
+    }
+
+    /** Reopen the app-owned browser while retaining its persistent profile. */
+    public void reopenBrowser() {
+        runOnPlaywright(() -> {
+            closeBrowserInternal();
+            initInternal();
+        });
+    }
+
+    private void closeBrowserInternal() {
         log.info("开始关闭Playwright管理器...");
 
         try {
-            // 关闭所有页面
-            if (bossPage != null) {
-                bossPage.close();
-                log.info("Boss直聘页面已关闭");
-            }
-            if (liepinPage != null) {
-                liepinPage.close();
-                log.info("猎聘页面已关闭");
-            }
-            if (job51Page != null) {
-                job51Page.close();
-                log.info("51job页面已关闭");
-            }
-            if (zhilianPage != null) {
-                zhilianPage.close();
-                log.info("智联招聘页面已关闭");
-            }
-
             // 关闭共享的BrowserContext（持久化上下文关闭即等于关浏览器，没有独立的 Browser 对象）
             if (context != null) {
                 context.close();
                 log.info("共享BrowserContext已关闭，浏览器已退出");
             }
 
+        } catch (Exception e) {
+            log.warn("关闭浏览器上下文失败: {}", e.getClass().getSimpleName());
+        }
+        try {
             if (playwright != null) {
                 playwright.close();
                 log.info("Playwright实例已关闭");
@@ -1839,7 +1927,31 @@ public class PlaywrightManager {
 
             log.info("Playwright管理器关闭完成！");
         } catch (Exception e) {
-            log.error("关闭Playwright管理器时发生错误", e);
+            log.warn("关闭Playwright失败: {}", e.getClass().getSimpleName());
+        } finally {
+            markBrowserClosed();
+            context = null;
+            playwright = null;
+            bossPage = null;
+            liepinPage = null;
+            job51Page = null;
+            zhilianPage = null;
+        }
+    }
+
+    private void markBrowserClosed() {
+        browserClosed = true;
+        // Publish disabled runtime status while leaving the persistent browser profile untouched.
+        for (String platform : List.of("boss", "liepin", "51job", "zhilian")) {
+            if (isPlatformEnabled(platform)) setLoginStatus(platform, false);
+        }
+        loginStatus.replaceAll((platform, value) -> false);
+        if (isPlatformEnabled("boss")) {
+            applyBossLoginResult(BossLoginProbe.unknown("助手浏览器已关闭", "closed"));
+        }
+        if (isPlatformEnabled("liepin")) {
+            applyLiepinLoginResult(new LiepinLoginProbe.Result(
+                    LiepinLoginProbe.State.UNKNOWN, "助手浏览器已关闭"));
         }
     }
 
@@ -1847,7 +1959,20 @@ public class PlaywrightManager {
      * 检查Playwright是否已初始化
      */
     public boolean isInitialized() {
-        return playwright != null && context != null && bossPage != null && !browserClosed;
+        if (playwright == null || context == null || browserClosed) return false;
+        BrowserPlatformMode mode = currentMode();
+        return (!mode.enables("boss") || usablePage(bossPage))
+                && (!mode.enables("liepin") || usablePage(liepinPage))
+                && (!mode.enables("51job") || usablePage(job51Page))
+                && (!mode.enables("zhilian") || usablePage(zhilianPage));
+    }
+
+    private boolean usablePage(Page page) {
+        try {
+            return page != null && !page.isClosed();
+        } catch (RuntimeException failure) {
+            return false;
+        }
     }
 
     /**
@@ -1858,6 +1983,7 @@ public class PlaywrightManager {
      * 发起任务前先过一遍这里。
      */
     public synchronized void ensureReady() {
+        if (switchingMode) throw new BrowserModeSwitchBusyException();
         if (isInitialized()) {
             return;
         }
@@ -1913,7 +2039,13 @@ public class PlaywrightManager {
      * @return 是否已登录
      */
     public boolean isLoggedIn(String platform) {
-        return loginStatus.getOrDefault(platform, false);
+        if (switchingMode || !isPlatformEnabled(platform)) return false;
+        boolean loggedIn = switch (platform) {
+            case "boss" -> bossLoginResult.state() == BossLoginProbe.State.LOGGED_IN;
+            case "liepin" -> liepinLoginResult.state() == LiepinLoginProbe.State.LOGGED_IN;
+            default -> loginStatus.getOrDefault(platform, false);
+        };
+        return loggedIn && isInitialized();
     }
 
     /**
@@ -1924,67 +2056,31 @@ public class PlaywrightManager {
      */
     public void setLoginStatus(String platform, boolean isLoggedIn) {
         Boolean previousStatus = loginStatus.get(platform);
+        if ("boss".equals(platform) && !isLoggedIn) {
+            bossLoginResult = new BossLoginProbe.Result(BossLoginProbe.State.LOGGED_OUT,
+                    "页面显示未登录或已退出登录", "login");
+        }
+        if ("liepin".equals(platform) && !isLoggedIn) {
+            liepinLoginResult = new LiepinLoginProbe.Result(LiepinLoginProbe.State.LOGGED_OUT,
+                    "页面显示未登录或已退出登录");
+        }
 
         // 只有状态真正发生变化时才更新和通知
         if (previousStatus == null || previousStatus != isLoggedIn) {
             loginStatus.put(platform, isLoggedIn);
 
-            // Boss平台：在设置未登录状态时，顺带引导到登录页并切换二维码扫码
-            if ("boss".equals(platform) && !isLoggedIn) {
-                try {
-                    if (bossPage != null) {
-                        String currentUrl = null;
-                        try { currentUrl = bossPage.url(); } catch (Exception ignored) {}
-
-                        // 避免重复导航：若当前已在登录页则不再二次跳转
-                        if (currentUrl == null || !currentUrl.contains("/web/user/")) {
-                            bossPage.navigate(BOSS_URL + "/web/user/?ka=header-login");
-                            try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                        }
-
-                        // 尝试切换到二维码登录（点击“APP扫码登录”按钮），优先使用新版选择器
-                        try {
-                            Locator qrSwitch = bossPage.locator(".btn-sign-switch.ewm-switch").first();
-                            if (isVisibleQuick(qrSwitch)) {
-                                qrSwitch.click();
-                            } else {
-                                // 兜底：按文本匹配内部提示
-                                Locator tip = bossPage.getByText("APP扫码登录").first();
-                                if (isVisibleQuick(tip)) {
-                                    tip.click();
-                                    log.info("已点击包含文本的二维码登录切换提示（APP扫码登录）");
-                                } else {
-                                    // 兼容旧版选择器
-                                    Locator legacy = bossPage.locator("li.sign-switch-tip").first();
-                                    if (isVisibleQuick(legacy)) {
-                                        legacy.click();
-                                        log.info("已通过旧版选择器切换二维码登录（li.sign-switch-tip）");
-                                    } else {
-                                        log.info("未找到二维码登录切换按钮，保持当前登录页");
-                                    }
-                                }
-                            }
-                        } catch (Exception e) {
-                            log.debug("切换二维码登录失败: {}", e.getMessage());
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("设置Boss未登录状态时执行登录引导失败: {}", e.getMessage());
-                }
-            }
-
-            // 通知所有监听器（触发SSE推送）
-            LoginStatusChange change = new LoginStatusChange(platform, isLoggedIn, System.currentTimeMillis());
-            loginStatusListeners.forEach(listener -> {
-                try {
-                    listener.accept(change);
-                } catch (Exception e) {
-                    log.error("通知登录状态监听器失败: platform={}, isLoggedIn={}", platform, isLoggedIn, e);
-                }
-            });
+            // State changes must never navigate, click a login control, or clear session data.
+            notifyLoginStatus(new LoginStatusChange(platform, isLoggedIn, System.currentTimeMillis()));
 
 //            log.info("登录状态已更新: platform={}, isLoggedIn={}", platform, isLoggedIn);
         }
+    }
+
+    private void notifyLoginStatus(LoginStatusChange change) {
+        loginStatusListeners.forEach(listener -> {
+            try { listener.accept(change); }
+            catch (Exception e) { log.debug("通知登录状态监听器失败: {}", change.platform()); }
+        });
     }
 
     /**
@@ -2066,6 +2162,11 @@ public class PlaywrightManager {
     /**
      * LoginStatusChange - 登录状态变化DTO
      */
-    public record LoginStatusChange(String platform, boolean isLoggedIn, long timestamp) {
+    public record LoginStatusChange(String platform, boolean isLoggedIn, long timestamp,
+                                    String state, String message) {
+        public LoginStatusChange(String platform, boolean isLoggedIn, long timestamp) {
+            this(platform, isLoggedIn, timestamp, isLoggedIn ? "LOGGED_IN" : "LOGGED_OUT",
+                    isLoggedIn ? "已登录" : "未登录");
+        }
     }
 }

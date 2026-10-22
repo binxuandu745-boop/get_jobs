@@ -18,6 +18,7 @@ type StatsResponse = {
     total: number
     delivered: number
     pending: number
+    unknown: number
     filtered: number
     failed: number
     avgMonthlyK?: number | null
@@ -58,6 +59,12 @@ type PagedResult = {
   total: number
   page: number
   size: number
+}
+
+function deliveryStatusLabel(delivered?: number) {
+  if (delivered === 2) return "待确认"
+  if (delivered === 1) return "已投递"
+  return "未投递"
 }
 
 import { API_BASE } from "@/lib/api"
@@ -227,7 +234,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
   const [detailJob, setDetailJob] = useState<LiepinJob | null>(null)
   const [computedSalaryBuckets, setComputedSalaryBuckets] = useState<BucketValue[]>([])
 
-  const statusOptions = ["未投递", "已投递"]
+  const statusOptions = ["未投递", "已投递", "待确认"]
 
   useEffect(() => {
     loadStats()
@@ -349,7 +356,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
         it.jobExpReq || "",
         it.jobEduReq || "",
         it.hrName || "",
-        (it.delivered === 1 ? "已投递" : "未投递"),
+        deliveryStatusLabel(it.delivered),
         it.jobLink || "",
         it.createTime || "",
       ])
@@ -443,6 +450,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
     const base = "px-2 py-1 rounded-full text-xs font-medium whitespace-nowrap"
     const v = (value || "").trim()
     if (kind === "delivery") {
+      if (v === "待确认") return `${base} bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300`
       if (v.includes("已投递")) return `${base} bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300`
       return `${base} bg-slate-100 text-slate-700 dark:bg-slate-800/50 dark:text-slate-300`
     }
@@ -467,6 +475,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
       { title: "总岗位数", value: k?.total ?? 0 },
       { title: "已投递", value: k?.delivered ?? 0 },
       { title: "未投递", value: k?.pending ?? 0 },
+      { title: "待确认", value: k?.unknown ?? 0 },
       { title: "平均月薪(K)", value: (k?.avgMonthlyK ?? avgMonthlyKFromItems ?? 0) },
     ]
   }, [stats, items])
@@ -542,7 +551,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
       )}
 
       {/* KPI */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
         {kpiCards.map((k) => (
           <Card key={k.title} className="border-white/20">
             <CardContent className="pt-6">
@@ -552,6 +561,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
           </Card>
         ))}
       </div>
+      <p className="text-sm text-muted-foreground">已投递表示历史记录或已确认沟通，不代表 HR 已收到；待确认表示操作结果尚未确认，禁止自动重复。</p>
 
       {/* 筛选区域 */}
       <Card>
@@ -693,10 +703,10 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
         <Card>
           <CardHeader>
             <CardTitle className="text-base flex items-center gap-2"><BiPieChart className="text-primary" />按状态</CardTitle>
-            <CardDescription>已投递与未投递占比</CardDescription>
+            <CardDescription>已投递、未投递与待确认占比（绿色、灰色、琥珀色）</CardDescription>
           </CardHeader>
           <CardContent>
-            <ChartCanvas type="pie" title="按状态" labels={(stats?.charts?.byStatus || []).map(x => x.name)} data={(stats?.charts?.byStatus || []).map(x => x.value)} colors={["#10b981", "#64748b"]} />
+            <ChartCanvas type="pie" title="按状态" labels={(stats?.charts?.byStatus || []).map(x => x.name)} data={(stats?.charts?.byStatus || []).map(x => x.value)} colors={(stats?.charts?.byStatus || []).map(x => x.name === "待确认" ? "#f59e0b" : x.name === "已投递" ? "#10b981" : "#64748b")} />
           </CardContent>
         </Card>
         <Card>
@@ -771,7 +781,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
                     <td className="py-2 px-3 whitespace-nowrap">{it.jobEduReq || ""}</td>
                     <td className="py-2 px-3 whitespace-nowrap">{it.hrName || ""}</td>
                     <td className="py-2 px-3 whitespace-nowrap">
-                      <span className={badgeClass("delivery", it.delivered === 1 ? "已投递" : "未投递")}>{it.delivered === 1 ? "已投递" : "未投递"}</span>
+                      <span className={badgeClass("delivery", deliveryStatusLabel(it.delivered))}>{deliveryStatusLabel(it.delivered)}</span>
                     </td>
                     <td className="py-2 px-3 whitespace-nowrap">
                       {it.jobLink ? (
@@ -804,7 +814,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
                   <div><span className="text-muted-foreground">经验：</span>{detailJob.jobExpReq || ""}</div>
                   <div><span className="text-muted-foreground">学历：</span>{detailJob.jobEduReq || ""}</div>
                   <div><span className="text-muted-foreground">HR：</span>{detailJob.hrName || ""}</div>
-                  <div><span className="text-muted-foreground">状态：</span>{detailJob.delivered === 1 ? "已投递" : "未投递"}</div>
+                  <div><span className="text-muted-foreground">状态：</span><span className={badgeClass("delivery", deliveryStatusLabel(detailJob.delivered))}>{deliveryStatusLabel(detailJob.delivered)}</span></div>
                   <div><span className="text-muted-foreground">创建时间：</span>{formatDateOnly(detailJob.createTime)}</div>
                 </div>
                 <div className="mt-4">

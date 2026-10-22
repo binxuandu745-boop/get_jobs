@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.getjobs.application.service.CookieService;
 import com.getjobs.worker.dto.JobProgressMessage;
 import com.getjobs.worker.manager.PlaywrightManager;
+import com.getjobs.worker.manager.BrowserModeSwitchBusyException;
 import com.getjobs.worker.service.BossJobService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -46,22 +47,22 @@ public class BossController {
         bossProgressEmitters.add(emitter);
 
         emitter.onCompletion(() -> {
-            log.info("Boss进度SSE连接已完成");
+            log.info("[BOSS] 管理页投递进度 SSE 连接已关闭");
             bossProgressEmitters.remove(emitter);
         });
         emitter.onTimeout(() -> {
-            log.info("Boss进度SSE连接超时");
+            log.info("[BOSS] 管理页投递进度 SSE 连接超时");
             bossProgressEmitters.remove(emitter);
         });
         emitter.onError(e -> {
-            log.error("Boss进度SSE连接错误", e);
+            log.error("[BOSS] 管理页投递进度 SSE 连接异常", e);
             bossProgressEmitters.remove(emitter);
         });
 
         try {
             emitter.send(SseEmitter.event().name("connected").data(Map.of("message", "已连接到Boss投递进度推送")));
         } catch (IOException e) {
-            log.error("发送SSE连接消息失败", e);
+            log.error("[BOSS] 发送投递进度 SSE 连接消息失败", e);
         }
         return emitter;
     }
@@ -105,7 +106,7 @@ public class BossController {
                 response.put("runningSeconds", seconds);
                 return ResponseEntity.badRequest().body(response);
             }
-            CompletableFuture.runAsync(() -> bossJobService.executeDelivery(pm -> {
+            playwrightManager.startPlatformTask("boss", () -> bossJobService.executeDelivery(pm -> {
                 sendBossProgress(pm);
                 log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
             }));
@@ -114,6 +115,9 @@ public class BossController {
             response.put("status", "started");
             log.info("通过API启动Boss任务成功");
             return ResponseEntity.ok(response);
+        } catch (BrowserModeSwitchBusyException busy) {
+            return ResponseEntity.status(409).body(Map.of("success", false, "status", "busy",
+                    "message", busy.getMessage()));
         } catch (Exception e) {
             log.error("启动Boss任务失败", e);
             response.put("success", false);
@@ -185,10 +189,10 @@ public class BossController {
                         e instanceof ClientAbortException ||
                         (e.getCause() instanceof ClientAbortException) ||
                         (e instanceof IOException && String.valueOf(e.getMessage()).contains("中止了一个已建立的连接"))) {
-                    log.debug("Boss进度 SSE 客户端已断开，移除连接: {}", e.getMessage());
+                    log.debug("[BOSS] 管理页投递进度 SSE 客户端已断开，移除连接: {}", e.getMessage());
                     try { emitter.complete(); } catch (Exception ignored) {}
                 } else {
-                    log.error("发送Boss进度消息失败", e);
+                    log.error("[BOSS] 发送投递进度 SSE 消息失败", e);
                 }
                 deadEmitters.add(emitter);
             }
@@ -209,10 +213,10 @@ public class BossController {
                         e instanceof ClientAbortException ||
                         (e.getCause() instanceof ClientAbortException) ||
                         (e instanceof IOException && String.valueOf(e.getMessage()).contains("中止了一个已建立的连接"))) {
-                    log.debug("Boss进度 SSE 客户端已断开（心跳），移除连接: {}", e.getMessage());
+                    log.debug("[BOSS] 管理页投递进度 SSE 客户端已断开（心跳），移除连接: {}", e.getMessage());
                     try { emitter.complete(); } catch (Exception ignored) {}
                 } else {
-                    log.error("发送Boss进度心跳失败", e);
+                    log.error("[BOSS] 发送投递进度 SSE 心跳失败", e);
                 }
                 deadEmitters.add(emitter);
             }

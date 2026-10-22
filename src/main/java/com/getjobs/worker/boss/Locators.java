@@ -24,7 +24,7 @@ public class Locators {
      * 岗位列表
      */
     // 定位所有岗位卡片，用于获取当前获取到的岗位总数
-    public static final String JOB_LIST_SELECTOR = "ul.rec-job-list li.job-card-box";
+    public static final String JOB_LIST_SELECTOR = "li.job-card-box, li.job-card-wrapper";
     // 岗位名称
     public static final String JOB_NAME = "a.job-name";
     // 公司名称

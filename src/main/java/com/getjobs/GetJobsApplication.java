@@ -17,6 +17,12 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 @EnableAsync
 public class GetJobsApplication {
     public static void main(String[] args) {
-        SpringApplication.run(GetJobsApplication.class, args);
+        SpringApplication application = new SpringApplication(GetJobsApplication.class);
+        // Windows desktop pauses can show a native alert; other environments retain Boot's default.
+        // An explicit -Djava.awt.headless=true still disables desktop notifications.
+        if (System.getProperty("os.name", "").startsWith("Windows")) {
+            application.setHeadless(false);
+        }
+        application.run(args);
     }
 }

@@ -5,6 +5,7 @@ import com.getjobs.application.entity.ZhilianConfigEntity;
 import com.getjobs.application.service.CookieService;
 import com.getjobs.application.service.ZhilianService;
 import com.getjobs.worker.manager.PlaywrightManager;
+import com.getjobs.worker.manager.BrowserModeSwitchBusyException;
 import com.getjobs.worker.service.ZhilianJobService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -287,7 +288,7 @@ public class ZhilianController {
             }
 
             // 异步启动新任务
-            CompletableFuture.runAsync(() -> {
+            playwrightManager.startPlatformTask("zhilian", () -> {
                 zhilianJobService.executeDelivery(progressMessage -> {
                     log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
                 });
@@ -300,6 +301,9 @@ public class ZhilianController {
             log.info("通过API启动智联招聘任务成功");
             return ResponseEntity.ok(response);
 
+        } catch (BrowserModeSwitchBusyException busy) {
+            return ResponseEntity.status(409).body(Map.of("success", false, "status", "busy",
+                    "message", busy.getMessage()));
         } catch (Exception e) {
             log.error("启动智联招聘任务失败", e);
             response.put("success", false);

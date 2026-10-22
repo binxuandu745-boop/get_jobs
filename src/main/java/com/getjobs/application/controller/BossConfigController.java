@@ -6,6 +6,8 @@ import com.getjobs.application.service.BossService;
 import com.getjobs.application.entity.BlacklistEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.dao.DataAccessException;
+import org.springframework.http.ResponseEntity;
 
 import java.util.HashMap;
 import java.util.List;
@@ -104,14 +106,7 @@ public class BossConfigController {
 
         // 职位类型：保存为中文名（单值）
         if (config.getJobType() != null) {
-            java.util.List<String> list = bossService.parseListString(config.getJobType());
-            java.util.List<String> names = bossService.toNames("jobType", list);
-            String name = names != null && !names.isEmpty()
-                    ? names.get(0)
-                    : (bossService.getOptionByTypeAndCode("jobType", config.getJobType()) != null
-                        ? bossService.getOptionByTypeAndCode("jobType", config.getJobType()).getName()
-                        : config.getJobType());
-            config.setJobType(name);
+            config.setJobType(bossService.normalizeJobTypeToName(config.getJobType()));
         }
 
         // 为避免每次新增导致错乱：当ID缺失时也执行“选择性更新第一条”策略
@@ -121,6 +116,18 @@ public class BossConfigController {
         }
         return bossService.saveOrUpdateFirstSelective(config);
   }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<?> invalidJobType() {
+        return ResponseEntity.badRequest().body(Map.of("success", false,
+                "message", "职位类型无效，请选择单一的已知职位类型"));
+    }
+
+    @ExceptionHandler({DataAccessException.class, IllegalStateException.class})
+    public ResponseEntity<?> unavailableConfiguration() {
+        return ResponseEntity.internalServerError().body(Map.of("success", false,
+                "message", "配置或职位类型字典暂不可用，请检查本地数据库配置"));
+    }
 
     /**
      * 将关键词字符串标准化为 JSON 字符串列表。

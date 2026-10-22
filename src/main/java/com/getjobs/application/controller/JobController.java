@@ -7,25 +7,31 @@ import com.getjobs.application.entity.Job51OptionEntity;
 import com.getjobs.application.service.CookieService;
 import com.getjobs.application.service.Job51Service;
 import com.getjobs.worker.manager.PlaywrightManager;
+import com.getjobs.worker.manager.BrowserModeSwitchBusyException;
 // Boss 控制器已独立，移除 Boss 依赖
 import com.getjobs.worker.service.Job51JobService;
 import com.getjobs.worker.dto.JobProgressMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.connector.ClientAbortException;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
@@ -49,7 +55,9 @@ public class JobController {
 
     // SSE emitter lists
     private final List<SseEmitter> job51ProgressEmitters = new CopyOnWriteArrayList<>();
-    private final List<SseEmitter> loginStatusEmitters = new CopyOnWriteArrayList<>();
+    // 标记订阅来源，而不是读取可在连接存活期间变化的浏览器模式。
+    private final ConcurrentMap<SseEmitter, String> loginStatusEmitters = new ConcurrentHashMap<>();
+    private boolean loginStatusListenerRegistered;
 
     // ==================== 51job 投递进度 SSE ====================
 
@@ -60,17 +68,17 @@ public class JobController {
         job51ProgressEmitters.add(emitter);
 
         emitter.onCompletion(() -> {
-            log.info("51job进度SSE连接已完成");
+            log.info("[51job] 管理页投递进度 SSE 连接已关闭");
             job51ProgressEmitters.remove(emitter);
         });
 
         emitter.onTimeout(() -> {
-            log.info("51job进度SSE连接超时");
+            log.info("[51job] 管理页投递进度 SSE 连接超时");
             job51ProgressEmitters.remove(emitter);
         });
 
         emitter.onError(e -> {
-            log.error("51job进度SSE连接错误", e);
+            log.error("[51job] 管理页投递进度 SSE 连接异常", e);
             job51ProgressEmitters.remove(emitter);
         });
 
@@ -79,7 +87,7 @@ public class JobController {
                     .name("connected")
                     .data(Map.of("message", "已连接到51job投递进度推送")));
         } catch (IOException e) {
-            log.error("发送SSE连接消息失败", e);
+            log.error("[51job] 发送投递进度 SSE 连接消息失败", e);
         }
 
         return emitter;
@@ -87,24 +95,24 @@ public class JobController {
 
     /** SSE - 登录状态变化推送 */
     @GetMapping(value = "/jobs/login-status/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamLoginStatus() {
+    public SseEmitter streamLoginStatus(@RequestParam(name = "platform", required = false) String platform) {
+        String platformLabel = loginSubscriptionLabel(platform);
         SseEmitter emitter = new SseEmitter(0L);
-        loginStatusEmitters.add(emitter);
-
-        playwrightManager.addLoginStatusListener(this::sendLoginStatusChange);
+        ensureLoginStatusListenerRegistered();
+        loginStatusEmitters.put(emitter, platformLabel);
 
         emitter.onCompletion(() -> {
-            log.info("登录状态SSE连接已完成");
+            log.info("[{}] 管理页登录状态 SSE 连接已关闭", platformLabel);
             loginStatusEmitters.remove(emitter);
         });
 
         emitter.onTimeout(() -> {
-            log.info("登录状态SSE连接超时");
+            log.info("[{}] 管理页登录状态 SSE 连接超时", platformLabel);
             loginStatusEmitters.remove(emitter);
         });
 
         emitter.onError(e -> {
-            log.error("登录状态SSE连接错误", e);
+            log.error("[{}] 管理页登录状态 SSE 连接异常", platformLabel, e);
             loginStatusEmitters.remove(emitter);
         });
 
@@ -117,17 +125,40 @@ public class JobController {
             emitter.send(SseEmitter.event()
                     .name("connected")
                     .data(Map.of(
-                            "message", "已连接到登录状态推送",
+                            "message", "已连接到" + platformLabel + "登录状态推送",
                             "bossLoggedIn", bossLoggedIn,
+                            "bossLoginState", playwrightManager.getBossLoginState(),
+                            "bossLoginMessage", playwrightManager.getBossLoginMessage(),
                             "liepinLoggedIn", liepinLoggedIn,
+                            "liepinLoginState", playwrightManager.getLiepinLoginState(),
+                            "liepinLoginMessage", playwrightManager.getLiepinLoginMessage(),
                             "job51LoggedIn", job51LoggedIn,
                             "zhilianLoggedIn", zhilianLoggedIn
                     )));
         } catch (IOException e) {
-            log.error("发送SSE连接消息失败", e);
+            log.error("[{}] 发送登录状态 SSE 连接消息失败", platformLabel, e);
         }
 
         return emitter;
+    }
+
+    private static String loginSubscriptionLabel(String platform) {
+        if (platform == null || platform.isBlank()) return "共享";
+        return switch (platform.trim().toLowerCase(Locale.ROOT)) {
+            case "boss" -> "BOSS";
+            case "liepin" -> "猎聘";
+            case "51job" -> "51job";
+            case "zhilian" -> "智联招聘";
+            default -> throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "登录状态订阅平台只能是 boss、liepin、51job 或 zhilian");
+        };
+    }
+
+    private synchronized void ensureLoginStatusListenerRegistered() {
+        if (!loginStatusListenerRegistered) {
+            playwrightManager.addLoginStatusListener(this::sendLoginStatusChange);
+            loginStatusListenerRegistered = true;
+        }
     }
 
     private void sendJob51Progress(JobProgressMessage message) {
@@ -142,10 +173,10 @@ public class JobController {
                         e instanceof ClientAbortException ||
                         (e.getCause() instanceof ClientAbortException) ||
                         (e instanceof IOException && String.valueOf(e.getMessage()).contains("中止了一个已建立的连接"))) {
-                    log.debug("51job进度 SSE 客户端已断开，移除连接: {}", e.getMessage());
+                    log.debug("[51job] 管理页投递进度 SSE 客户端已断开，移除连接: {}", e.getMessage());
                     try { emitter.complete(); } catch (Exception ignored) {}
                 } else {
-                    log.error("发送51job进度消息失败", e);
+                    log.error("[51job] 发送投递进度 SSE 消息失败", e);
                 }
                 deadEmitters.add(emitter);
             }
@@ -155,13 +186,17 @@ public class JobController {
 
     private void sendLoginStatusChange(PlaywrightManager.LoginStatusChange change) {
         List<SseEmitter> deadEmitters = new CopyOnWriteArrayList<>();
-        for (SseEmitter emitter : loginStatusEmitters) {
+        for (Map.Entry<SseEmitter, String> subscription : loginStatusEmitters.entrySet()) {
+            SseEmitter emitter = subscription.getKey();
+            String platformLabel = subscription.getValue();
             try {
                 emitter.send(SseEmitter.event()
                         .name("login-status")
                         .data(objectMapper.writeValueAsString(Map.of(
                                 "platform", change.platform(),
                                 "isLoggedIn", change.isLoggedIn(),
+                                "state", change.state(),
+                                "message", change.message(),
                                 "timestamp", change.timestamp()
                         ))));
             } catch (Exception e) {
@@ -169,15 +204,15 @@ public class JobController {
                         e instanceof ClientAbortException ||
                         (e.getCause() instanceof ClientAbortException) ||
                         (e instanceof IOException && String.valueOf(e.getMessage()).contains("中止了一个已建立的连接"))) {
-                    log.debug("登录状态 SSE 客户端已断开，移除连接: {}", e.getMessage());
+                    log.debug("[{}] 管理页登录状态 SSE 客户端已断开，移除连接: {}", platformLabel, e.getMessage());
                     try { emitter.complete(); } catch (Exception ignored) {}
                 } else {
-                    log.error("发送登录状态消息失败", e);
+                    log.error("[{}] 发送登录状态 SSE 消息失败", platformLabel, e);
                 }
                 deadEmitters.add(emitter);
             }
         }
-        loginStatusEmitters.removeAll(deadEmitters);
+        deadEmitters.forEach(loginStatusEmitters::remove);
     }
 
     /** 心跳 - 登录状态 SSE */
@@ -185,7 +220,9 @@ public class JobController {
     public void heartbeatLoginStatus() {
         if (loginStatusEmitters.isEmpty()) return;
         List<SseEmitter> deadEmitters = new CopyOnWriteArrayList<>();
-        for (SseEmitter emitter : loginStatusEmitters) {
+        for (Map.Entry<SseEmitter, String> subscription : loginStatusEmitters.entrySet()) {
+            SseEmitter emitter = subscription.getKey();
+            String platformLabel = subscription.getValue();
             try {
                 emitter.send(SseEmitter.event().name("ping").data("keep-alive"));
             } catch (Exception e) {
@@ -193,18 +230,18 @@ public class JobController {
                         e instanceof ClientAbortException ||
                         (e.getCause() instanceof ClientAbortException) ||
                         (e instanceof IOException && String.valueOf(e.getMessage()).contains("中止了一个已建立的连接"))) {
-                    log.debug("登录状态 SSE 客户端已断开（心跳），移除连接: {}", e.getMessage());
+                    log.debug("[{}] 管理页登录状态 SSE 客户端已断开（心跳），移除连接: {}", platformLabel, e.getMessage());
                     try { emitter.complete(); } catch (Exception ignored) {}
                 } else {
-                    log.error("发送登录状态心跳失败", e);
+                    log.error("[{}] 发送登录状态 SSE 心跳失败", platformLabel, e);
                 }
                 deadEmitters.add(emitter);
             }
         }
-        loginStatusEmitters.removeAll(deadEmitters);
+        deadEmitters.forEach(loginStatusEmitters::remove);
     }
 
-    /** 心跳 - Boss进度 SSE */
+    /** 心跳 - 51job进度 SSE */
     @Scheduled(fixedRate = 30000)
     public void heartbeatJob51Progress() {
         if (job51ProgressEmitters.isEmpty()) return;
@@ -217,10 +254,10 @@ public class JobController {
                         e instanceof ClientAbortException ||
                         (e.getCause() instanceof ClientAbortException) ||
                         (e instanceof IOException && String.valueOf(e.getMessage()).contains("中止了一个已建立的连接"))) {
-                    log.debug("51job进度 SSE 客户端已断开（心跳），移除连接: {}", e.getMessage());
+                    log.debug("[51job] 管理页投递进度 SSE 客户端已断开（心跳），移除连接: {}", e.getMessage());
                     try { emitter.complete(); } catch (Exception ignored) {}
                 } else {
-                    log.error("发送51job进度心跳失败", e);
+                    log.error("[51job] 发送投递进度 SSE 心跳失败", e);
                 }
                 deadEmitters.add(emitter);
             }
@@ -395,7 +432,7 @@ public class JobController {
                 response.put("status", "running");
                 return ResponseEntity.badRequest().body(response);
             }
-            CompletableFuture.runAsync(() -> job51JobService.executeDelivery(pm -> {
+            playwrightManager.startPlatformTask("51job", () -> job51JobService.executeDelivery(pm -> {
                 // 推送到 SSE 并保留日志输出
                 sendJob51Progress(pm);
                 log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
@@ -405,6 +442,9 @@ public class JobController {
             response.put("status", "started");
             log.info("通过API启动51job任务成功");
             return ResponseEntity.ok(response);
+        } catch (BrowserModeSwitchBusyException busy) {
+            return ResponseEntity.status(409).body(Map.of("success", false, "status", "busy",
+                    "message", busy.getMessage()));
         } catch (Exception e) {
             log.error("启动51job任务失败", e);
             response.put("success", false);

@@ -62,3 +62,5 @@ dist/
 .gradle/
 # 持久化浏览器用户数据（含登录态，绝对不能提交）
 browser-data/
+# User-uploaded screenshots and offline analysis records (may contain personal information).
+.local/offline-screenshots/

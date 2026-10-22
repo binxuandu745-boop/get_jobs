@@ -1,6 +1,7 @@
 package com.getjobs.application.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.getjobs.application.entity.LiepinEntity;
 import com.getjobs.application.entity.LiepinConfigEntity;
 import com.getjobs.application.entity.LiepinOptionEntity;
@@ -18,6 +19,7 @@ import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.stream.Collectors;
@@ -98,8 +100,28 @@ public class LiepinService {
                 // 保留 create_time，更新其他字段与 update_time
                 entity.setCreateTime(existing.getCreateTime());
                 entity.setUpdateTime(now);
-                if (entity.getDelivered() == null) entity.setDelivered(existing.getDelivered());
-                liepinMapper.updateById(entity);
+                // 普通快照不能重置已沟通或结果待确认的状态。
+                entity.setDelivered(existing.getDelivered() == null ? 0 : existing.getDelivered());
+                // 显式排除 delivered，避免读取旧状态后覆盖并发写入的预留或确认。
+                UpdateWrapper<LiepinEntity> snapshot = new UpdateWrapper<>();
+                snapshot.eq("job_id", entity.getJobId())
+                        .set(entity.getJobTitle() != null, "job_title", entity.getJobTitle())
+                        .set(entity.getJobLink() != null, "job_link", entity.getJobLink())
+                        .set(entity.getJobSalaryText() != null, "job_salary_text", entity.getJobSalaryText())
+                        .set(entity.getJobArea() != null, "job_area", entity.getJobArea())
+                        .set(entity.getJobEduReq() != null, "job_edu_req", entity.getJobEduReq())
+                        .set(entity.getJobExpReq() != null, "job_exp_req", entity.getJobExpReq())
+                        .set(entity.getJobPublishTime() != null, "job_publish_time", entity.getJobPublishTime())
+                        .set(entity.getCompId() != null, "comp_id", entity.getCompId())
+                        .set(entity.getCompName() != null, "comp_name", entity.getCompName())
+                        .set(entity.getCompIndustry() != null, "comp_industry", entity.getCompIndustry())
+                        .set(entity.getCompScale() != null, "comp_scale", entity.getCompScale())
+                        .set(entity.getHrId() != null, "hr_id", entity.getHrId())
+                        .set(entity.getHrName() != null, "hr_name", entity.getHrName())
+                        .set(entity.getHrTitle() != null, "hr_title", entity.getHrTitle())
+                        .set(entity.getHrImId() != null, "hr_im_id", entity.getHrImId())
+                        .set("update_time", now);
+                liepinMapper.update(null, snapshot);
             }
         } catch (Exception e) {
             log.warn("保存猎聘岗位快照失败 job_id={}: {}", entity.getJobId(), e.getMessage());
@@ -150,6 +172,39 @@ public class LiepinService {
     }
 
     /**
+     * 发送前原子预留沟通机会：0/null -> 2。2 表示结果待确认，禁止自动重试。
+     * 只有成功写入预留状态的调用方才能执行一次站外沟通动作。
+     */
+    public boolean reserveCommunication(Long jobId) {
+        return transitionCommunication(jobId,
+                "UPDATE liepin_data SET delivered=2, update_time=? " +
+                        "WHERE job_id=? AND (delivered=0 OR delivered IS NULL)");
+    }
+
+    /**
+     * 仅在站外沟通已得到明确确认后，将本次预留的 2 改为 1。
+     * 0 行更新不是成功；写入失败时保留结果待确认，禁止自动重试。
+     */
+    public boolean confirmCommunication(Long jobId) {
+        return transitionCommunication(jobId,
+                "UPDATE liepin_data SET delivered=1, update_time=? WHERE job_id=? AND delivered=2");
+    }
+
+    private boolean transitionCommunication(Long jobId, String sql) {
+        if (jobId == null) return false;
+        try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
+            ps.setLong(2, jobId);
+            int updated = ps.executeUpdate();
+            if (!conn.getAutoCommit()) conn.commit();
+            return updated == 1;
+        } catch (SQLException e) {
+            // 不附原始错误或 cause，避免数据库路径、SQL 等信息向上层泄漏。
+            throw new IllegalStateException("猎聘沟通状态写入失败: " + e.getClass().getSimpleName());
+        }
+    }
+
+    /**
      * 批量插入岗位快照（仅不存在时），减少单次网络响应后的数据库操作时间
      */
     public void insertSnapshotsIfNotExistsBatch(java.util.List<LiepinEntity> entities) {
@@ -169,9 +224,13 @@ public class LiepinService {
                         .in("job_id", idList)
         );
         java.util.Set<Long> existingIds = new java.util.HashSet<>();
+        java.util.Map<Long, Integer> existingDeliveryStates = new java.util.HashMap<>();
         if (existing != null) {
             for (LiepinEntity e : existing) {
-                if (e != null && e.getJobId() != null) existingIds.add(e.getJobId());
+                if (e != null && e.getJobId() != null) {
+                    existingIds.add(e.getJobId());
+                    existingDeliveryStates.put(e.getJobId(), e.getDelivered());
+                }
             }
         }
 
@@ -180,7 +239,11 @@ public class LiepinService {
         LocalDateTime now = LocalDateTime.now();
         for (LiepinEntity e : entities) {
             if (e == null || e.getJobId() == null) continue;
-            if (existingIds.contains(e.getJobId())) continue;
+            if (existingIds.contains(e.getJobId())) {
+                // Reuse the existing batch lookup so the worker can skip already-contacted jobs.
+                e.setDelivered(existingDeliveryStates.get(e.getJobId()));
+                continue;
+            }
             if (e.getCreateTime() == null) e.setCreateTime(now);
             e.setUpdateTime(now);
             if (e.getDelivered() == null) e.setDelivered(0);
@@ -400,6 +463,7 @@ public class LiepinService {
         public long total;
         public long delivered;
         public long pending;
+        public long unknown; // 已预留但沟通结果待确认，禁止自动重试
         public long filtered; // 猎聘暂无，置0
         public long failed;   // 猎聘暂无，置0
         public Double avgMonthlyK; // 平均中位数K
@@ -462,7 +526,7 @@ public class LiepinService {
         try {
             com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<LiepinEntity> wrapper = new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<>();
 
-            // 状态：已投递/未投递 -> delivered 1/0
+            // 状态：已投递/未投递/待确认 -> delivered 1/0/2
             if (statuses != null && !statuses.isEmpty()) {
                 Set<Integer> deliveredSet = new HashSet<>();
                 for (String s : statuses) {
@@ -470,6 +534,7 @@ public class LiepinService {
                         String t = s.trim();
                         if ("已投递".equals(t)) deliveredSet.add(1);
                         if ("未投递".equals(t)) deliveredSet.add(0);
+                        if ("待确认".equals(t)) deliveredSet.add(2);
                     }
                 }
                 if (!deliveredSet.isEmpty()) {
@@ -516,13 +581,15 @@ public class LiepinService {
             resp.kpi.total = filtered.size();
             resp.kpi.delivered = filtered.stream().filter(e -> Objects.equals(e.getDelivered(), 1)).count();
             resp.kpi.pending = filtered.stream().filter(e -> e.getDelivered() == null || Objects.equals(e.getDelivered(), 0)).count();
+            resp.kpi.unknown = filtered.stream().filter(e -> Objects.equals(e.getDelivered(), 2)).count();
             resp.kpi.filtered = 0;
             resp.kpi.failed = 0;
             resp.kpi.avgMonthlyK = countMedian > 0 ? Math.round((sumMedian / countMedian) * 100.0) / 100.0 : null;
 
             // Charts 聚合
             Map<String, Long> byStatus = filtered.stream()
-                    .collect(Collectors.groupingBy(e -> Objects.equals(e.getDelivered(), 1) ? "已投递" : "未投递", Collectors.counting()));
+                    .collect(Collectors.groupingBy(e -> Objects.equals(e.getDelivered(), 1) ? "已投递" :
+                            Objects.equals(e.getDelivered(), 2) ? "待确认" : "未投递", Collectors.counting()));
             byStatus.forEach((k, v) -> charts.byStatus.add(new NameValue(k, v)));
 
             Map<String, Long> byCity = filtered.stream()
@@ -629,6 +696,7 @@ public class LiepinService {
                     String t = s.trim();
                     if ("已投递".equals(t)) deliveredSet.add(1);
                     if ("未投递".equals(t)) deliveredSet.add(0);
+                    if ("待确认".equals(t)) deliveredSet.add(2);
                 }
             }
             if (!deliveredSet.isEmpty()) wrapper.in("delivered", deliveredSet);

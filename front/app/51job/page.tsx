@@ -63,7 +63,7 @@ export default function Job51Page() {
       return
     }
 
-    const client = createSSEWithBackoff(`${API}/api/jobs/login-status/stream`, {
+    const client = createSSEWithBackoff(`${API}/api/jobs/login-status/stream?platform=51job`, {
       onOpen: () => {
         console.log('[51job SSE] ✅ 连接已打开')
       },

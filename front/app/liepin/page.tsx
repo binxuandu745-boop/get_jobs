@@ -12,6 +12,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import AnalysisContent from '@/app/liepin/analysis/AnalysisContent'
 import PageHeader from '@/app/components/PageHeader'
 import { API_BASE } from '@/lib/api'
+import { liepinTaskStatusLabel } from '@/lib/liepin-task-status'
+import { useLiepinTaskStatus } from '@/lib/use-liepin-task-status'
 
 interface LiepinConfig {
   id?: number
@@ -31,6 +33,14 @@ interface LiepinOptions {
   city: LiepinOption[]
 }
 
+const PAUSE_REASON_LABELS: Record<string, string> = {
+  SECURITY_VERIFICATION: '需要手动完成安全验证',
+  PAGE_UNAVAILABLE: '猎聘页面不可用',
+  READ_FAILED: '页面读取失败',
+  COMMUNICATION_UNCONFIRMED: '沟通结果待核对',
+  RECORD_STATE_UNAVAILABLE: '本地沟通记录状态待核对',
+}
+
 export default function LiepinPage() {
   const [config, setConfig] = useState<LiepinConfig>({
     keywords: '',
@@ -45,11 +55,16 @@ export default function LiepinPage() {
   const [saveResult, setSaveResult] = useState<{ success: boolean; message: string } | null>(null)
   const [isCustomCity, setIsCustomCity] = useState(false) // 是否手动输入城市
   const [isLoggedIn, setIsLoggedIn] = useState(false)
-  const [isDelivering, setIsDelivering] = useState(false)
+  const { status: taskStatus, statusError, refreshing, pendingAction, refreshStatus, runAction } = useLiepinTaskStatus()
+  const [taskActionMessage, setTaskActionMessage] = useState('')
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showLogoutResultDialog, setShowLogoutResultDialog] = useState(false)
   const [logoutResult, setLogoutResult] = useState<{ success: boolean; message: string } | null>(null)
+  const taskStatusKnown = taskStatus !== null && !statusError
+  const taskIsActive = taskStatus?.isRunning === true || taskStatus?.starting === true
+  const taskIsPaused = taskStatus?.paused === true
+  const taskLabel = liepinTaskStatusLabel(taskStatus, Boolean(statusError))
 
   useEffect(() => {
     fetchAllData()
@@ -61,7 +76,7 @@ export default function LiepinPage() {
       return
     }
 
-    const client = createSSEWithBackoff(`${API_BASE}/api/jobs/login-status/stream`, {
+    const client = createSSEWithBackoff(`${API_BASE}/api/jobs/login-status/stream?platform=liepin`, {
       onOpen: () => {
         console.log('[SSE] 连接已打开')
       },
@@ -195,67 +210,30 @@ export default function LiepinPage() {
   }
 
   const handleStartDelivery = async () => {
-    try {
-      setIsDelivering(true)
-      const response = await fetch(`${API_BASE}/api/liepin/start`, {
-        method: 'POST',
-      })
-      const data = await response.json()
-
-      if (data.success) {
-        // 启动成功：不弹框
-      } else {
-        // 启动失败：不弹框
-        console.warn('启动失败：', data.message)
-        setIsDelivering(false)
-      }
-    } catch (error) {
-      console.error('Failed to start delivery:', error)
-      // 启动失败：不弹框
-      setIsDelivering(false)
-    }
+    setTaskActionMessage('')
+    const result = await runAction('start')
+    if (result && !result.success) setTaskActionMessage(result.message)
   }
 
   const handleStopDelivery = async () => {
-    try {
-      const response = await fetch(`${API_BASE}/api/liepin/stop`, {
-        method: 'POST',
-      })
-      const data = await response.json()
-
-      if (data.success) {
-        // 停止成功：不弹框
-        setIsDelivering(false)
-      } else {
-        // 停止失败：不弹框
-        console.warn('停止失败：', data.message)
-      }
-    } catch (error) {
-      console.error('Failed to stop delivery:', error)
-      // 停止失败：不弹框
-    }
+    setTaskActionMessage('')
+    const result = await runAction('stop')
+    if (result) setTaskActionMessage(result.message)
   }
 
   const triggerLogout = async () => {
-    try {
-      const response = await fetch(`${API_BASE}/api/liepin/logout`, { method: 'POST' })
-      const data = await response.json()
-      if (data.success) {
+      const result = await runAction('logout')
+      if (!result) return
+      if (result.success) {
         setIsLoggedIn(false)
-        setIsDelivering(false)
         console.info('已退出登录，数据库Cookie已置空')
         setLogoutResult({ success: true, message: '已退出登录，Cookie已清空。' })
         setShowLogoutResultDialog(true)
       } else {
-        console.warn('退出登录失败：', data.message)
-        setLogoutResult({ success: false, message: `退出登录失败：${data.message || '服务返回异常。'}` })
+        console.warn('退出登录失败：', result.message)
+        setLogoutResult({ success: false, message: `退出登录失败：${result.message}` })
         setShowLogoutResultDialog(true)
       }
-    } catch (error) {
-      console.error('Failed to logout:', error)
-      setLogoutResult({ success: false, message: '退出登录失败：网络或服务异常。' })
-      setShowLogoutResultDialog(true)
-    }
   }
 
   if (loading) {
@@ -272,7 +250,27 @@ export default function LiepinPage() {
         accentBgClass="bg-purple-500"
         actions={
           <div className="flex items-center gap-2">
-            {checkingLogin ? (
+            {pendingAction ? (
+              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 px-4 shadow">
+                {pendingAction === 'start' ? '正在启动...' : pendingAction === 'stop' ? '正在请求停止...' : '正在退出...'}
+              </Button>
+            ) : !taskStatusKnown ? (
+              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 px-4 shadow">
+                {taskStatus === null && !statusError ? '同步任务状态中...' : '任务状态未知'}
+              </Button>
+            ) : taskIsPaused && taskIsActive ? (
+              <Button size="sm" disabled className="rounded-full bg-amber-100 text-amber-800 px-4 shadow">
+                已暂停，正在结束本轮
+              </Button>
+            ) : taskStatus?.starting ? (
+              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 px-4 shadow">
+                正在启动...
+              </Button>
+            ) : taskIsActive ? (
+              <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
+                <BiStop className="mr-1" /> 停止投递
+              </Button>
+            ) : checkingLogin ? (
               <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
                 <BiPlay className="mr-1" /> 检查登录中...
               </Button>
@@ -280,16 +278,12 @@ export default function LiepinPage() {
               <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
                 <BiPlay className="mr-1" /> 请先登录猎聘
               </Button>
-            ) : isDelivering ? (
-              <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiStop className="mr-1" /> 停止投递
-              </Button>
             ) : (
               <Button onClick={handleStartDelivery} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiPlay className="mr-1" /> 开始投递
+                <BiPlay className="mr-1" /> {taskIsPaused ? '重新开始' : '开始投递'}
               </Button>
             )}
-            <Button onClick={() => setShowLogoutDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
+            <Button onClick={() => setShowLogoutDialog(true)} disabled={Boolean(pendingAction) || !taskStatusKnown || taskIsActive} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
               <BiLogOut className="mr-1" /> 退出登录
             </Button>
             <Button onClick={handleSave} size="sm" className="rounded-full bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-600 hover:to-indigo-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
@@ -298,6 +292,31 @@ export default function LiepinPage() {
           </div>
         }
       />
+
+      <section className={`rounded-2xl border p-4 ${taskIsPaused ? 'border-amber-500/60 bg-amber-500/10' : 'border-border bg-card'}`} aria-label="猎聘任务状态" aria-live="polite">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">投递任务</span>
+            <span className={`rounded-full px-3 py-1 text-xs font-semibold ${!taskStatusKnown ? 'bg-gray-500/15 text-muted-foreground' : taskIsPaused ? 'bg-amber-500/20 text-amber-700 dark:text-amber-300' : taskIsActive ? 'bg-teal-500/15 text-teal-700 dark:text-teal-300' : 'bg-gray-500/15 text-muted-foreground'}`}>
+              {taskStatus === null && !statusError ? '同步中' : taskLabel}
+            </span>
+          </div>
+          <Button variant="outline" size="sm" onClick={() => void refreshStatus()} disabled={refreshing || Boolean(pendingAction)}>
+            {refreshing ? '刷新中...' : '刷新任务状态'}
+          </Button>
+        </div>
+        {taskIsPaused && (
+          <div className="mt-3 space-y-1 text-sm text-amber-800 dark:text-amber-200" role="alert">
+            <p className="font-medium">已自动暂停：{PAUSE_REASON_LABELS[taskStatus?.pauseReason || ''] || taskStatus?.pauseReason || '请查看任务日志并手动核对。'}</p>
+            {taskStatus?.pauseReason && <p className="text-xs">原因代码：{taskStatus.pauseReason}</p>}
+            <p>不会自动恢复或重发待确认岗位。核对后可点击“重新开始”，这会开始新一轮，不是断点继续。</p>
+          </div>
+        )}
+        {taskStatus?.lastMessage && <p className="mt-2 whitespace-pre-wrap break-words text-sm" role="status">{taskStatus.lastMessage}</p>}
+        {statusError && <p className="mt-3 text-sm text-amber-700 dark:text-amber-300" role="alert">{statusError}</p>}
+        {taskActionMessage && <p className="mt-3 text-sm text-muted-foreground" role="status">{taskActionMessage}</p>}
+        <p className="mt-2 text-xs text-muted-foreground">每2秒同步本机任务状态；切回页面及操作后也会刷新，不增加招聘网站访问。</p>
+      </section>
 
       <Tabs defaultValue="config" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
@@ -445,6 +464,7 @@ export default function LiepinPage() {
                     取消
                   </Button>
                   <Button
+                    disabled={Boolean(pendingAction) || !taskStatusKnown || taskIsActive}
                     onClick={async () => {
                       await triggerLogout()
                       setShowLogoutDialog(false)

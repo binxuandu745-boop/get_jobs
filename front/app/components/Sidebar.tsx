@@ -7,6 +7,7 @@ import { BiEnvelope, BiBriefcase, BiSearch, BiTask, BiUserCircle, BiBrain, BiMoo
 import { motion } from 'framer-motion'
 import { useTheme } from 'next-themes'
 import { API_BASE } from '@/lib/api'
+import BrowserModeSelector from './BrowserModeSelector'
 
 export default function Sidebar() {
   const pathname = usePathname()
@@ -67,6 +68,7 @@ export default function Sidebar() {
   const envGroup = [
     { href: '/env-config', icon: BiEnvelope, label: '环境配置', color: 'text-cyan-300' },
     { href: '/ai-config', icon: BiBrain, label: 'AI配置', color: 'text-purple-300' },
+    { href: '/screenshot-analysis', icon: BiBrain, label: '截图识别', color: 'text-cyan-300' },
   ]
 
   const platformGroup = [
@@ -148,6 +150,8 @@ export default function Sidebar() {
 
       {/* 导航菜单 */}
       <nav className="p-4 space-y-4 overflow-y-auto h-[calc(100vh-280px)]">
+        <BrowserModeSelector />
+
         {/* 环境配置分组 */}
         <div>
           <div className="px-4 py-2 text-white dark:text-waterloo text-xs uppercase tracking-wide">环境配置</div>

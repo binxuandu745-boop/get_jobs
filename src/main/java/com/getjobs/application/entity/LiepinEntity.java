@@ -37,7 +37,7 @@ public class LiepinEntity {
     private String hrImId;        // recruiter.imId
 
     // ========== 投递状态 ==========
-    // 是否已投递：0 未投递（默认），1 已投递
+    // 0 未沟通；1 历史已投递或已确认建立沟通（不代表送达）；2 预留/结果待确认，禁止自动重发
     private Integer delivered;
 
     // ========== 系统字段 ==========

@@ -1,4 +1,8 @@
 spring:
+  servlet:
+    multipart:
+      max-file-size: 8MB # 离线截图入口；后端同时校验实际文件内容与尺寸
+      max-request-size: 25MB # 同一岗位最多6张、合计24MiB，余量用于multipart边界和规则
   application:
     name: get_jobs
   profiles:
@@ -26,6 +30,7 @@ spring:
 
 # 服务器配置
 server:
+  address: 127.0.0.1  # 管理接口只允许本机访问
   port: 9527  # 后端 API 固定端口（别用 9679：落在 Windows Hyper-V 保留段 9628-9727 里，绑不上）
 
 # 日志配置
@@ -49,3 +54,35 @@ mybatis-plus:
     db-config:
       id-type: auto
   mapper-locations: classpath*:/mapper/**/*.xml
+
+# 本机已安装 Chrome Canary；使用项目独立的 browser-data 目录。
+getjobs:
+  browser:
+    channel: chrome-canary
+    platform-mode: liepin # 未保存前端选择时的启动默认值；支持boss/liepin/51job/zhilian；all仅旧配置兼容
+    boss-only: true # 仅作旧配置兼容；当前只初始化猎聘
+  boss:
+    screenshot-analysis-enabled: true # 网页保存的开关优先；截图提取岗位字段，再由Java筛选后沟通
+    preview-only: false # 允许真实投递；启动助手本身不会自动发起任务
+    pause-desktop-alert-enabled: true # 保护性暂停时弹出桌面置顶提示，关闭提示不会恢复任务
+    detail-response-timeout-ms: 60000 # 详情响应等待上限；超时为读取失败，不等同于安全验证
+    max-preview-jobs: 5
+    required-role-terms: "Java,后端,服务端"
+    require-internship: false # 不因标题或描述缺少“实习”而排除 Java／后端岗位
+    action-delay-min-ms: 2000 # 岗位处理步骤之间的最短等待，单位毫秒
+    action-delay-max-ms: 4000 # 每次在最短与最长等待之间取随机值
+    mouse-movement-enabled: true # 每次点击前在页面内分段移动鼠标；不接管系统鼠标
+    mouse-movement-min-ms: 450 # 单次移动的计划耗时下限，实际还包含浏览器调用耗时
+    mouse-movement-max-ms: 1100 # 每次随机耗时并缓入缓出；移动期间仍检查停止与岗位身份
+    minimum-monthly-salary: 5000
+    minimum-daily-salary: 125 # 用户确认接受125元/天及以上的日薪实习
+    random-city-enabled: true # 每次开始任务时随机选一城，任务内保持不变
+    random-city-pool: "101010100,101020100,101280600,101280100,101210100,101270100,101190100,101200100,101190400,101110100"
+  liepin:
+    action-delay-min-ms: 2000 # 与当前BOSS源码配置一致；只在真实岗位处理/搜索/翻页/沟通前等待
+    action-delay-max-ms: 4000
+    required-role-terms: "Java,后端,服务端"
+    require-internship: false # 不新增实习字样硬限制
+    minimum-monthly-salary: 4500 # 用户已确认其他平台以4500元/月保底
+    minimum-daily-salary: 125 # 日薪下限独立判断；不换算月薪
+    communication-confirm-timeout-ms: 15000 # 只读等待同岗位“继续聊”证据；不自动重复点击

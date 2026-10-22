@@ -6,6 +6,7 @@ import com.getjobs.application.entity.LiepinOptionEntity;
 import com.getjobs.application.service.CookieService;
 import com.getjobs.application.service.LiepinService;
 import com.getjobs.worker.manager.PlaywrightManager;
+import com.getjobs.worker.manager.BrowserModeSwitchBusyException;
 import com.getjobs.worker.service.LiepinJobService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,7 +16,6 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 
 /**
  * 猎聘控制器
@@ -52,7 +52,8 @@ public class LiepinController {
             boolean isLoggedIn = playwrightManager.isLoggedIn("liepin");
             response.put("success", true);
             response.put("isLoggedIn", isLoggedIn);
-            response.put("message", isLoggedIn ? "已登录" : "未登录");
+            response.put("state", playwrightManager.getLiepinLoginState());
+            response.put("message", playwrightManager.getLiepinLoginMessage());
 
             return ResponseEntity.ok(response);
         } catch (Exception e) {
@@ -63,6 +64,15 @@ public class LiepinController {
         }
     }
 
+    /** Read-only manual recheck; never initializes the browser or launches delivery. */
+    @PostMapping("/check-login")
+    public ResponseEntity<Map<String, Object>> refreshLoginStatus() {
+        if (!liepinJobService.isRunning() && !playwrightManager.isPlaywrightBusy()) {
+            playwrightManager.refreshLiepinLoginStatus();
+        }
+        return checkLoginStatus();
+    }
+
     /**
      * 启动猎聘自动投递任务
      * @return 响应结果
@@ -70,6 +80,8 @@ public class LiepinController {
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> startLiepinJob() {
         Map<String, Object> response = new HashMap<>();
+        LiepinJobService.StartSnapshot preparedStart = null;
+        boolean submitted = false;
 
         try {
             // 未登录则不允许启动
@@ -88,12 +100,16 @@ public class LiepinController {
                 return ResponseEntity.badRequest().body(response);
             }
 
-            // 异步启动新任务
-            CompletableFuture.runAsync(() -> {
-                liepinJobService.executeDelivery(progressMessage -> {
+            // 同步发布启动中状态，避免轮询在异步执行入场前读到旧暂停状态。
+            preparedStart = liepinJobService.prepareStart();
+            LiepinJobService.StartSnapshot admission = preparedStart;
+            // 保留管理器的原子平台占位，模式切换不能穿过任务启动窗口。
+            playwrightManager.startPlatformTask("liepin", () -> {
+                liepinJobService.executePreparedDelivery(admission, progressMessage -> {
                     log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
                 });
             });
+            submitted = true;
 
             response.put("success", true);
             response.put("message", "猎聘任务启动成功");
@@ -102,12 +118,17 @@ public class LiepinController {
             log.info("通过API启动猎聘任务成功");
             return ResponseEntity.ok(response);
 
+        } catch (BrowserModeSwitchBusyException busy) {
+            return ResponseEntity.status(409).body(Map.of("success", false, "status", "busy",
+                    "message", busy.getMessage()));
         } catch (Exception e) {
             log.error("启动猎聘任务失败", e);
             response.put("success", false);
             response.put("message", "启动猎聘任务失败: " + e.getMessage());
             response.put("error", e.getClass().getSimpleName());
             return ResponseEntity.internalServerError().body(response);
+        } finally {
+            if (!submitted) liepinJobService.cancelPreparedStart(preparedStart);
         }
     }
 

@@ -45,7 +45,7 @@ export default function ZhilianPage() {
       return
     }
 
-    const client = createSSEWithBackoff(`${API_BASE}/api/jobs/login-status/stream`, {
+    const client = createSSEWithBackoff(`${API_BASE}/api/jobs/login-status/stream?platform=zhilian`, {
       onOpen: () => console.log('[智联招聘 SSE] 连接已打开'),
       onError: (e, attempt, delay) => {
         console.warn(`[智联招聘 SSE] 连接错误，第${attempt}次重连，延迟 ${delay}ms`, e)

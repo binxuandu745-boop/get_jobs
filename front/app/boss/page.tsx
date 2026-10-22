@@ -12,6 +12,7 @@ import { Select } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PageHeader from '@/app/components/PageHeader'
 import AnalysisContent from '@/app/boss/analysis/AnalysisContent'
+import BossScreenshotAutomation from '@/app/boss/BossScreenshotAutomation'
 import { API_BASE } from '@/lib/api'
 
 interface BossConfig {
@@ -98,7 +99,9 @@ export default function BossPage() {
   const [blacklistType, setBlacklistType] = useState('company') // 默认为公司
   const [loading, setLoading] = useState(true)
   const [isLoggedIn, setIsLoggedIn] = useState(false)
+  const [loginState, setLoginState] = useState('UNKNOWN')
   const [isDelivering, setIsDelivering] = useState(false)
+  const [taskMessage, setTaskMessage] = useState('')
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
@@ -117,7 +120,7 @@ export default function BossPage() {
       return
     }
 
-    const client = createSSEWithBackoff(`${API_BASE}/api/jobs/login-status/stream`, {
+    const client = createSSEWithBackoff(`${API_BASE}/api/jobs/login-status/stream?platform=boss`, {
       onOpen: () => {
         console.log('[SSE] 连接已打开')
       },
@@ -132,6 +135,7 @@ export default function BossPage() {
             try {
               const data = JSON.parse(event.data)
               setIsLoggedIn(data.bossLoggedIn || false)
+              setLoginState(data.bossLoginState || (data.bossLoggedIn ? 'LOGGED_IN' : 'LOGGED_OUT'))
               setCheckingLogin(false)
             } catch (error) {
               console.error('[SSE] 解析连接消息失败:', error)
@@ -145,6 +149,7 @@ export default function BossPage() {
               const data = JSON.parse(event.data)
               if (data.platform === 'boss') {
                 setIsLoggedIn(data.isLoggedIn)
+                setLoginState(data.state || (data.isLoggedIn ? 'LOGGED_IN' : 'LOGGED_OUT'))
                 setCheckingLogin(false)
               }
             } catch (error) {
@@ -158,6 +163,60 @@ export default function BossPage() {
 
     return () => {
       client.close()
+    }
+  }, [])
+
+  // Only connect to the local management API. A terminal error must clear the running UI.
+  useEffect(() => {
+    if (typeof EventSource === 'undefined') return
+    let active = true
+    let progressRevision = 0
+    const refreshTaskStatus = async () => {
+      const revisionAtRequest = progressRevision
+      try {
+        const response = await fetch(`${API_BASE}/api/boss/status`)
+        if (!response.ok) return
+        const status = await response.json()
+        if (!active || revisionAtRequest !== progressRevision) return
+        setIsDelivering(Boolean(status.isRunning))
+        setTaskMessage(status.lastMessage === '尚未运行' ? '' : (status.lastMessage || ''))
+      } catch (error) {
+        console.warn('无法读取任务状态', error)
+      }
+    }
+    const progressClient = createSSEWithBackoff(`${API_BASE}/api/boss/stream`, {
+      listeners: [
+        { name: 'connected', handler: () => { void refreshTaskStatus() } },
+        {
+          name: 'progress',
+          handler: (event) => {
+            try {
+              const message = JSON.parse(event.data)
+              if (message.platform !== 'boss') return
+              progressRevision += 1
+              setTaskMessage(message.message || '')
+              if (message.type === 'success' || message.type === 'error') {
+                setIsDelivering(false)
+              }
+              if (message.type === 'error') {
+                setSaveResult({
+                  success: false,
+                  title: message.message?.startsWith('已暂停') ? '任务已暂停' : '任务未完成',
+                  message: message.message || '任务停止，请检查页面及日志',
+                })
+                setShowSaveDialog(true)
+              }
+            } catch (error) {
+              console.warn('无法解析任务进度', error)
+            }
+          },
+        },
+        { name: 'ping', handler: () => {} },
+      ],
+    })
+    return () => {
+      active = false
+      progressClient.close()
     }
   }, [])
 
@@ -475,6 +534,7 @@ export default function BossPage() {
   const handleStartDelivery = async () => {
     try {
       setIsDelivering(true)
+      setTaskMessage('正在启动任务...')
       const response = await fetch(`${API_BASE}/api/boss/start`, {
         method: 'POST',
       })
@@ -561,11 +621,15 @@ export default function BossPage() {
         accentBgClass="bg-teal-500"
         actions={
           <div className="flex items-center gap-2">
-            {checkingLogin ? (
+            {checkingLogin && !isDelivering ? (
               <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
                 <BiPlay className="mr-1" /> 检查登录中...
               </Button>
-            ) : !isLoggedIn ? (
+            ) : loginState === 'UNKNOWN' && !isDelivering ? (
+              <Button size="sm" disabled className="rounded-full bg-amber-100 text-amber-700 cursor-not-allowed px-4 shadow">
+                <BiPlay className="mr-1" /> 登录状态待确认
+              </Button>
+            ) : !isLoggedIn && !isDelivering ? (
               <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
                 <BiPlay className="mr-1" /> 请先登录Boss
               </Button>
@@ -588,6 +652,14 @@ export default function BossPage() {
         }
       />
 
+      {taskMessage && (
+        <div role="status" className={`rounded-xl border p-4 text-sm ${taskMessage.startsWith('已暂停')
+          ? 'border-amber-300 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100'
+          : 'border-stroke text-muted-foreground dark:border-strokedark'}`}>
+          {taskMessage}
+        </div>
+      )}
+
       <Tabs defaultValue="config" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
           <TabsTrigger value="config">平台配置</TabsTrigger>
@@ -595,6 +667,7 @@ export default function BossPage() {
         </TabsList>
 
         <TabsContent value="config" className="space-y-6 mt-6">
+          <BossScreenshotAutomation />
           {/* 平台说明 */}
           <Card className="animate-in fade-in slide-in-from-bottom-5 duration-700">
             <CardHeader>
