@@ -1265,8 +1265,15 @@ public class Boss {
             String decision = result.evaluation().decision();
             screenshotProgress("截图识别完成：" + result.imageCount() + "张，" + decision, result.id());
             if (!"COMPLETE".equals(result.status()) || result.fields() == null) {
-                throw BossTaskPausedException.detailsUnavailable("截图识别失败（"
-                        + (result.errorCode() == null ? "INVALID_RESULT" : result.errorCode())
+                String code = result.errorCode() == null ? "INVALID_RESULT" : result.errorCode();
+                if ("INVALID_EXTRACTION".equals(code)) {
+                    // The vision call itself succeeded; only this job's model JSON was unusable.
+                    // That is not an account or page problem, so skip the job and keep the run.
+                    screenshotProgress("截图识别跳过该岗位："
+                            + Objects.toString(result.errorMessage(), "模型输出不合规"), result.id());
+                    return false;
+                }
+                throw BossTaskPausedException.detailsUnavailable("截图识别未完成（" + code
                         + "），记录 " + result.id() + "；本轮未继续沟通");
             }
             ScreenshotFields fields = result.fields();

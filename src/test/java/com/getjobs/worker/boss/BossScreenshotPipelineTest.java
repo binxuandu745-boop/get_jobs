@@ -229,6 +229,20 @@ class BossScreenshotPipelineTest {
     }
 
     @Test
+    void invalidModelOutputSkipsThatJobWithoutPausingTheRun() throws Throwable {
+        // The vision call succeeded and only this job's JSON was unusable, so the run must continue.
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any())).thenReturn(invalidExtraction());
+
+        processCurrentJob();
+
+        verify(records, never()).recordScreenshotObservation(any());
+        verify(detailPage, never()).locator(CHAT);
+        verifyNoInteractions(greeting);
+        assertTrue(boss.getResultList().isEmpty());
+        verify(detailPage).close();
+    }
+
+    @Test
     void stoppingDuringModelCallDiscardsMatchAndCannotCommunicate() throws Exception {
         when(screening.analyze(eq(detailPage), eq(ID), any(), any())).thenAnswer(ignored -> {
             stopped.set(true);
@@ -503,6 +517,13 @@ class BossScreenshotPipelineTest {
         return new ScreenshotFields("Java视觉实习", "视觉公司", "上海", "6-8K", new BigDecimal("6000"),
                 new BigDecimal("8000"), "MONTH", null, null, "本科", List.of("Java"), List.of(2028),
                 "VISION_DESCRIPTION", List.of());
+    }
+
+    private static ScreenshotAnalysisResult invalidExtraction() {
+        return new ScreenshotAnalysisResult("test-result", "ERROR", "2026-10-22T00:00:00Z", "boss-test-id-1.png",
+                "test-hash", null, new ScreenshotEvaluation("MISMATCH",
+                List.of("识别失败，按不符合条件处理：AI输出未通过字段校验"), List.of()),
+                "INVALID_EXTRACTION", "AI输出未通过字段校验：字段类型或长度不合法：jobTitle", "mock-vision");
     }
 
     private void installRealScreening(OfflineScreenshotService analysis) {

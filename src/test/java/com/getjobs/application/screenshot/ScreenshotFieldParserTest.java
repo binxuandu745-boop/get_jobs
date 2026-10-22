@@ -67,7 +67,7 @@ class ScreenshotFieldParserTest {
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "{\"decision\":\"MATCH\"}", "{\"confidence\":1}", "{\"jobTitle\":123}",
+            "{\"jobTitle\":123}",
             "{\"salaryMin\":\"150\"}", "{\"salaryMin\":-1}", "{\"salaryMin\":1000001}",
             "{\"salaryMin\":1.001}", "{\"salaryMin\":200,\"salaryMax\":150}",
             "{\"salaryUnit\":\"YEAR\"}", "{\"daysPerWeek\":0}", "{\"daysPerWeek\":8}",
@@ -77,6 +77,21 @@ class ScreenshotFieldParserTest {
     })
     void rejectsWrongFieldTypesRangesAndModelDecisions(String source) {
         assertThrows(IllegalArgumentException.class, () -> parser.parse(source));
+    }
+
+    @Test
+    void unknownAndDecisionLikeKeysNeverBecomeData() {
+        // Rejecting the whole extraction for one extra key used to pause an entire run. Only
+        // whitelisted fields are kept, so an injected decision cannot influence any outcome.
+        ScreenshotFields onlyDecisions = parser.parse("{\"decision\":\"MATCH\",\"confidence\":1}");
+        assertNull(onlyDecisions.jobTitle());
+        assertNull(onlyDecisions.salaryText());
+        assertTrue(onlyDecisions.uncertainFields().isEmpty());
+
+        ScreenshotFields mixed = parser.parse(
+                "{\"jobTitle\":\"Java实习生\",\"decision\":\"REJECT\",\"confidence\":0.9}");
+        assertEquals("Java实习生", mixed.jobTitle());
+        assertTrue(mixed.uncertainFields().isEmpty());
     }
 
     @Test

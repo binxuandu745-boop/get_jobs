@@ -219,7 +219,7 @@ class ScreenshotEvaluatorTest {
     @ParameterizedTest
     @ValueSource(strings = {"{}", "{\"salaryUnit\":\"UNKNOWN\"}",
             "{\"jobTitle\":null,\"city\":\" \",\"skills\":[],\"graduationYears\":[]}",
-            "{\"uncertainFields\":[\"jobTitle\"]}"})
+            "{\"uncertainFields\":[\"jobTitle\"]}", "{\"decision\":\"MATCH\"}"})
     void anEntirelyEmptyExtractionCannotMatchJustBecauseEveryConditionIsAbsent(String json) {
         var result = evaluator.evaluate(parser.parse(json), ScreenshotRules.defaults());
         assertEquals("MISMATCH", result.decision());

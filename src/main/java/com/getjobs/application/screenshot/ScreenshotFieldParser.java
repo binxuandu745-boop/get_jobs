@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -16,6 +18,7 @@ import java.util.regex.Pattern;
 
 /** Parses bounded observation JSON. Screenshot text and model output are untrusted data. */
 public class ScreenshotFieldParser {
+    private static final Logger log = LoggerFactory.getLogger(ScreenshotFieldParser.class);
     static final int MAX_MODEL_TEXT_LENGTH = 32_000;
     private static final Set<String> ALLOWED_FIELDS = Set.of("jobTitle", "company", "city", "salaryText",
             "salaryMin", "salaryMax", "salaryUnit", "daysPerWeek", "durationMonths", "education",
@@ -41,9 +44,15 @@ public class ScreenshotFieldParser {
             throw new IllegalArgumentException("AI返回不是有效的单个JSON对象");
         }
         if (root == null || !root.isObject()) throw new IllegalArgumentException("AI返回必须是JSON对象");
+        List<String> unsupported = new ArrayList<>();
         root.fieldNames().forEachRemaining(name -> {
-            if (!ALLOWED_FIELDS.contains(name)) throw new IllegalArgumentException("AI返回包含未支持的字段");
+            if (!ALLOWED_FIELDS.contains(name)) unsupported.add(name);
         });
+        if (!unsupported.isEmpty()) {
+            // Extra keys are never read, so they cannot steer a decision: ignore them instead of
+            // discarding a usable extraction. Names are sanitized and bounded before logging.
+            log.warn("忽略{}个未支持的AI字段：{}", unsupported.size(), summarize(unsupported));
+        }
         BigDecimal minimum = amount(root, "salaryMin");
         BigDecimal maximum = amount(root, "salaryMax");
         if (minimum != null && maximum != null && minimum.compareTo(maximum) > 0) {
@@ -59,6 +68,18 @@ public class ScreenshotFieldParser {
                 integer(root, "daysPerWeek", 1, 7), integer(root, "durationMonths", 1, 120),
                 text(root, "education", 80), strings(root, "skills", 40, 80), years(root),
                 text(root, "description", 8_000), strings(root, "uncertainFields", 32, 100));
+    }
+
+    /** Bounded, sanitized field names for diagnostics; model text itself never reaches the log. */
+    private static String summarize(List<String> names) {
+        StringBuilder summary = new StringBuilder();
+        for (String name : names.subList(0, Math.min(3, names.size()))) {
+            String cleaned = name.replaceAll("[^A-Za-z0-9_]", "");
+            if (cleaned.length() > 30) cleaned = cleaned.substring(0, 30);
+            if (summary.length() > 0) summary.append(',');
+            summary.append(cleaned.isEmpty() ? "?" : cleaned);
+        }
+        return summary.toString();
     }
 
     private static String text(JsonNode root, String key, int maximumLength) {
