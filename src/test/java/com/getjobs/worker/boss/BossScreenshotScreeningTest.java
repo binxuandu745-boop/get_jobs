@@ -140,6 +140,7 @@ class BossScreenshotScreeningTest {
             "https://www.zhipin.com/job_detail/other.html",
             "https://www.zhipin.com/job_detail/job-123-extra.html",
             "https://www.zhipin.com/web/geek/jobs",
+            "https://www.zhipin.com/web/geek/chat?jobId=job-123",
             "https://evil.example/job_detail/job-123.html",
             "http://www.zhipin.com/job_detail/job-123.html"
     })
@@ -151,6 +152,34 @@ class BossScreenshotScreeningTest {
             capture.verify(() -> BossJobScreenshotCapture.capture(page, ID, allowed), never());
         }
         verifyNoInteractions(analysis);
+    }
+
+    @Test
+    void chatPageForTheBoundJobIsAcceptedAfterStartingTheConversation() {
+        when(page.url()).thenReturn("https://www.zhipin.com/web/geek/chat?jobId=" + ID + "&uid=hr-1");
+
+        assertDoesNotThrow(() -> BossScreenshotScreening.requireBoundJobOrChat(page, ID));
+    }
+
+    @Test
+    void chatPageStillOnTheDetailUrlIsAccepted() {
+        assertDoesNotThrow(() -> BossScreenshotScreening.requireBoundJobOrChat(page, ID));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "https://www.zhipin.com/web/geek/chat?jobId=other-job",
+            "https://www.zhipin.com/web/geek/chat?encryptJobId=other-job",
+            "https://www.zhipin.com/web/geek/chat?jobId=",
+            "https://www.zhipin.com/web/geek/jobs?jobId=job-123",
+            "https://evil.example/web/geek/chat?jobId=job-123",
+            "http://www.zhipin.com/web/geek/chat?jobId=job-123"
+    })
+    void otherPagesAndOtherJobsAreStillRejectedAfterTheConversationStarts(String url) {
+        when(page.url()).thenReturn(url);
+
+        assertThrows(BossTaskPausedException.class,
+                () -> BossScreenshotScreening.requireBoundJobOrChat(page, ID));
     }
 
     private static List<OfflineScreenshotService.Upload> images() {

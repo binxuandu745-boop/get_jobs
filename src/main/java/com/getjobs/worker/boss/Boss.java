@@ -1298,7 +1298,13 @@ public class Boss {
             job.setRecruiter(hr == null ? "" : hr.optString("name", ""));
             allowed.run();
             screenshotProgress("截图岗位符合条件，准备沟通：" + job.getJobName(), result.id());
-            communicateFromDetailPage(keyword, job, detailUrl, detailPage, allowed);
+            // 沟通阶段只核对已绑定的详情页/聊天页，不再反复读后台列表：列表重绘时读选中链接会
+            // 卡在默认的 30 秒超时，而已经打开的详情页不会因为后台列表切换就投给别人。
+            Runnable chatPhase = () -> {
+                requireActionAllowed(detailPage);
+                BossScreenshotScreening.requireBoundJobOrChat(detailPage, jobId);
+            };
+            communicateFromDetailPage(keyword, job, detailUrl, detailPage, chatPhase);
             return true;
         } catch (BossTaskPausedException | CancellationException stopped) {
             throw stopped;
@@ -1439,7 +1445,9 @@ public class Boss {
         }
         BossPageSafety.requireUsablePage(detailPage);
         identityGuard.run();
+        long chatClickStarted = System.nanoTime();
         clickWithMouse(detailPage, chatBtn.first(), identityGuard);
+        log.info("已点击立即沟通，耗时 {} 毫秒", elapsedMillis(chatClickStarted));
         pauseBeforeAction(detailPage, "准备招呼内容");
         identityGuard.run();
 
@@ -1469,13 +1477,16 @@ public class Boss {
             }
             return;
         }
+        log.info("聊天输入框就绪，从点击沟通起耗时 {} 毫秒", elapsedMillis(chatClickStarted));
 
         // 5. AI智能生成打招呼语
         String aiMessage = null;
         if (config.getEnableAI()) {
             String jd = job.getJobInfo();
             if (jd != null && !jd.isEmpty()) {
+                long aiStarted = System.nanoTime();
                 aiMessage = generateAiMessage(keyword, job.getJobName(), jd);
+                log.info("AI 招呼语生成耗时 {} 毫秒", elapsedMillis(aiStarted));
             }
         }
         String message = isValidString(aiMessage) ? aiMessage : config.getSayHi();
@@ -1978,6 +1989,10 @@ public class Boss {
             remaining -= slice;
         }
         requireActionAllowed(actionPage);
+    }
+
+    private static long elapsedMillis(long startedNanos) {
+        return (System.nanoTime() - startedNanos) / 1_000_000L;
     }
 
     private void requireActionAllowed(Page actionPage) {

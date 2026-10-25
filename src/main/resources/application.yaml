@@ -69,11 +69,21 @@ getjobs:
     max-preview-jobs: 5
     required-role-terms: "Java,后端,服务端"
     require-internship: false # 不因标题或描述缺少“实习”而排除 Java／后端岗位
-    action-delay-min-ms: 2000 # 岗位处理步骤之间的最短等待，单位毫秒
-    action-delay-max-ms: 4000 # 每次在最短与最长等待之间取随机值
+#    action-delay-min-ms: 2000 # 岗位处理步骤之间的最短等待，单位毫秒
+#    action-delay-max-ms: 4000 # 每次在最短与最长等待之间取随机值
+#    mouse-movement-enabled: true # 每次点击前在页面内分段移动鼠标；不接管系统鼠标
+#    mouse-movement-min-ms: 450 # 单次移动的计划耗时下限，实际还包含浏览器调用耗时
+#    mouse-movement-max-ms: 1100 # 每次随机耗时并缓入缓出；移动期间仍检查停止与岗位身份
+#
+    action-delay-min-ms: 50 # 岗位处理步骤之间的最短等待，单位毫秒
+    action-delay-max-ms: 500 # 每次在最短与最长等待之间取随机值
     mouse-movement-enabled: true # 每次点击前在页面内分段移动鼠标；不接管系统鼠标
     mouse-movement-min-ms: 450 # 单次移动的计划耗时下限，实际还包含浏览器调用耗时
-    mouse-movement-max-ms: 1100 # 每次随机耗时并缓入缓出；移动期间仍检查停止与岗位身份
+    mouse-movement-max-ms: 10 # 每次随机耗时并缓入缓出；移动期间仍检查停止与岗位身份
+
+
+
+
     minimum-monthly-salary: 5000
     minimum-daily-salary: 125 # 用户确认接受125元/天及以上的日薪实习
     random-city-enabled: true # 每次开始任务时随机选一城，任务内保持不变
