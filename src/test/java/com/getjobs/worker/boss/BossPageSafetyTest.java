@@ -260,6 +260,87 @@ class BossPageSafetyTest {
                 "https://www.zhipin.com/web/geek/jobs?query=security-check"));
     }
 
+    @Test
+    void metadataOnlyCheckUsesCachedPageStateWithoutDomProbesOrWaits() {
+        Page page = mock(Page.class);
+        when(page.url()).thenReturn("https://www.zhipin.com/web/geek/jobs");
+
+        assertDoesNotThrow(() -> BossPageSafety.requireUsablePageMetadata(page));
+
+        verify(page).isClosed();
+        verify(page).url();
+        verifyNoMoreInteractions(page);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "https://www.zhipin.com/web/user/safe/verify-slider",
+            "https://www.zhipin.com/web/passport/zp/verify.html",
+            "https://www.zhipin.com/web/passport/zp/security.html",
+            "https://www.zhipin.com/security-check"
+    })
+    void metadataOnlyCheckStopsOnVerificationUrlWithoutDomOrRetry(String url) {
+        Page page = mock(Page.class);
+        when(page.url()).thenReturn(url);
+
+        BossTaskPausedException failure = assertThrows(BossTaskPausedException.class,
+                () -> BossPageSafety.requireUsablePageMetadata(page));
+
+        assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, failure.getReason());
+        verify(page).isClosed();
+        verify(page).url();
+        verifyNoMoreInteractions(page);
+    }
+
+    @Test
+    void metadataOnlyCheckStopsOnMissingOrClosedPageWithoutRetry() {
+        BossTaskPausedException missing = assertThrows(BossTaskPausedException.class,
+                () -> BossPageSafety.requireUsablePageMetadata(null));
+        assertEquals(BossTaskPausedException.Reason.JOB_DETAILS_UNAVAILABLE, missing.getReason());
+        Page page = mock(Page.class);
+        when(page.isClosed()).thenReturn(true);
+
+        BossTaskPausedException closed = assertThrows(BossTaskPausedException.class,
+                () -> BossPageSafety.requireUsablePageMetadata(page));
+
+        assertEquals(BossTaskPausedException.Reason.JOB_DETAILS_UNAVAILABLE, closed.getReason());
+        verify(page).isClosed();
+        verifyNoMoreInteractions(page);
+    }
+
+    @Test
+    void metadataOnlyCheckPreservesInterruptionBeforeAnyPageOperation() {
+        Page page = mock(Page.class);
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(CancellationException.class,
+                    () -> BossPageSafety.requireUsablePageMetadata(page));
+            assertTrue(Thread.currentThread().isInterrupted());
+            verifyNoInteractions(page);
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void metadataOnlyCheckNoticesInterruptionRaisedDuringCachedStateRead() {
+        Page page = mock(Page.class);
+        when(page.url()).thenAnswer(ignored -> {
+            Thread.currentThread().interrupt();
+            return "https://www.zhipin.com/web/geek/jobs";
+        });
+        try {
+            assertThrows(CancellationException.class,
+                    () -> BossPageSafety.requireUsablePageMetadata(page));
+            assertTrue(Thread.currentThread().isInterrupted());
+            verify(page).isClosed();
+            verify(page).url();
+            verifyNoMoreInteractions(page);
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
     private Page normalPage(boolean verificationVisible) {
         Page page = mock(Page.class);
         Locator verification = mock(Locator.class);

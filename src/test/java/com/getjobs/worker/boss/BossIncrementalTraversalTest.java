@@ -1,5 +1,7 @@
 package com.getjobs.worker.boss;
 
+import com.getjobs.application.screenshot.PageDiagnosticResult;
+import com.getjobs.application.screenshot.ScreenshotVisionException;
 import com.getjobs.application.service.AiService;
 import com.getjobs.application.service.BossService;
 import com.getjobs.worker.utils.PlaywrightUtil;
@@ -9,6 +11,9 @@ import com.microsoft.playwright.TimeoutError;
 import org.json.JSONObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.MockedConstruction;
 import org.mockito.MockedStatic;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -16,6 +21,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -41,6 +47,8 @@ class BossIncrementalTraversalTest {
     private final List<Locator> cardItems = new ArrayList<>();
     private final List<Locator> cardLinks = new ArrayList<>();
     private final AtomicReference<String> selectedId = new AtomicReference<>();
+    private final AtomicReference<Double> documentOrigin = new AtomicReference<>(12345.5);
+    private final AtomicReference<List<String>> diagnosticCards = new AtomicReference<>(List.of("first", "second"));
 
     @BeforeEach
     void setUp() {
@@ -51,6 +59,7 @@ class BossIncrementalTraversalTest {
         when(page.getByText(anyString())).thenReturn(ordinary);
         AtomicReference<String> currentUrl = new AtomicReference<>("https://www.zhipin.com/web/geek/jobs");
         when(page.url()).thenAnswer(ignored -> currentUrl.get());
+        when(page.evaluate(BossListPageDiagnosis.DOCUMENT_ORIGIN_SCRIPT)).thenAnswer(ignored -> documentOrigin.get());
         doAnswer(invocation -> {
             currentUrl.set(invocation.getArgument(0));
             return null;
@@ -322,6 +331,260 @@ class BossIncrementalTraversalTest {
         verify(page, times(1)).evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
         verify(page, times(1)).waitForCondition(any(BooleanSupplier.class), any(Page.WaitForConditionOptions.class));
         verify(page, never()).navigate(anyString(), any(Page.NavigateOptions.class));
+    }
+
+    @Test
+    void exhaustedDiagnosisFinishesCurrentSearchWithoutAnotherScrollOrSend() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        List<String> progress = new ArrayList<>();
+        boss.setProgressCallback((message, current, total) -> progress.add(message));
+
+        assertFalse(boss.loadNextJobBatch("Java实习", 2));
+
+        verify(diagnosis, times(1)).diagnose(eq(page), any(Runnable.class));
+        assertTrue(progress.stream().anyMatch(text -> text.contains("没有更多岗位")));
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void safetyDiagnosisPausesBeforeConsideringAnExhaustedOrGrowingList() {
+        BossListPageDiagnosis diagnosis = diagnosisWithListChange(PageDiagnosticResult.State.SECURITY_VERIFICATION,
+                List.of("first", "second", "third"));
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, stopped.getReason());
+        verify(diagnosis, times(1)).diagnose(eq(page), any(Runnable.class));
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = PageDiagnosticResult.State.class, names = {"LOADING", "UNKNOWN"})
+    void loadingOrUnknownDiagnosisPausesInsteadOfFinishingTheSearch(PageDiagnosticResult.State state) {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(state);
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertEquals(BossTaskPausedException.Reason.JOB_DETAILS_UNAVAILABLE, stopped.getReason());
+        verify(diagnosis, times(1)).diagnose(eq(page), any(Runnable.class));
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"MISSING_CONFIG", "INVALID_CONFIG", "VISION_AUTH_FAILED", "VISION_TIMEOUT",
+            "PAGE_DIAGNOSIS_TIMEOUT", "INVALID_PAGE_DIAGNOSIS", "PAGE_DIAGNOSIS_DOCUMENT_CHANGED"})
+    void failedOrUnconfiguredDiagnosisPausesWithSafeReason(String code) {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        doThrow(new ScreenshotVisionException(code, "upstream private secret"))
+                .when(diagnosis).diagnose(eq(page), any(Runnable.class));
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertEquals(BossTaskPausedException.Reason.JOB_DETAILS_UNAVAILABLE, stopped.getReason());
+        assertFalse(stopped.getMessage().contains("secret"));
+        verify(diagnosis, times(1)).diagnose(eq(page), any(Runnable.class));
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void disabledDiagnosisDoesNotCaptureOrCallTheModel() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        ReflectionTestUtils.setField(boss, "listPageDiagnosisEnabled", false);
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertTrue(stopped.getMessage().contains("截图诊断未启用"));
+        verifyNoInteractions(diagnosis);
+        verify(page, never()).screenshot(any(Page.ScreenshotOptions.class));
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void missingDiagnosisComponentRetainsTheOriginalProtectivePause() {
+        timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        ReflectionTestUtils.setField(boss, "listPageDiagnosis", null);
+
+        assertThrows(BossTaskPausedException.class, () -> boss.loadNextJobBatch("Java实习", 2));
+
+        verify(page, never()).screenshot(any(Page.ScreenshotOptions.class));
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void genuinelyAppendedCardsWinOverAnOldExhaustedScreenshot() {
+        diagnosisWithListChange(PageDiagnosticResult.State.EXHAUSTED, List.of("first", "second", "third"));
+
+        assertTrue(boss.loadNextJobBatch("Java实习", 2));
+
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void sameSizedReplacementListIsNeverTreatedAsExhausted() {
+        diagnosisWithListChange(PageDiagnosticResult.State.EXHAUSTED, List.of("new-first", "new-second"));
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertTrue(stopped.getMessage().contains("列表已刷新或替换"));
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void replacedListWithMoreCardsIsNotMistakenForAppendedCards() {
+        diagnosisWithListChange(PageDiagnosticResult.State.EXHAUSTED, List.of("other-first", "second", "third"));
+
+        assertThrows(BossTaskPausedException.class, () -> boss.loadNextJobBatch("Java实习", 2));
+
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void listShrinkingBeforeDiagnosisPreventsUsingAnyScreenshotResult() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        diagnosticCards.set(List.of("first"));
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertTrue(stopped.getMessage().contains("列表已刷新或缩短"));
+        verifyNoInteractions(diagnosis);
+        verify(page, never()).evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
+        verify(page, never()).waitForCondition(any(BooleanSupplier.class), any(Page.WaitForConditionOptions.class));
+        verify(page, never()).context();
+    }
+
+    @Test
+    void sameUrlReloadDuringLoadWaitPausesBeforeRequestingDiagnosis() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        doAnswer(ignored -> {
+            documentOrigin.set(67890.0);
+            throw new TimeoutError("mocked page reloaded at the same URL");
+        }).when(page).waitForCondition(any(BooleanSupplier.class), any(Page.WaitForConditionOptions.class));
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertTrue(stopped.getMessage().contains("页面已刷新"));
+        verifyNoInteractions(diagnosis);
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void sameSizedListReplacementDuringLoadWaitPausesBeforeRequestingDiagnosis() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        doAnswer(ignored -> {
+            diagnosticCards.set(List.of("replacement-first", "replacement-second"));
+            throw new TimeoutError("mocked list replaced while waiting");
+        }).when(page).waitForCondition(any(BooleanSupplier.class), any(Page.WaitForConditionOptions.class));
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertTrue(stopped.getMessage().contains("列表已刷新或替换"));
+        verifyNoInteractions(diagnosis);
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void changedSearchFiltersDuringDiagnosisPropagateTheSearchPause() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        String initial = "https://www.zhipin.com/web/geek/jobs?city=101&jobType=chosen";
+        AtomicReference<String> current = new AtomicReference<>(initial);
+        when(page.url()).thenAnswer(ignored -> current.get());
+        doAnswer(call -> {
+            current.set("https://www.zhipin.com/web/geek/jobs?city=102&jobType=chosen");
+            ((Runnable) call.getArgument(1)).run();
+            return new PageDiagnosticResult(PageDiagnosticResult.State.EXHAUSTED, List.of("没有更多岗位了"));
+        }).when(diagnosis).diagnose(eq(page), any(Runnable.class));
+
+        try (BossJobDetailSession session = new BossJobDetailSession(page)) {
+            session.beginNavigation();
+            session.bindSearchContext(initial);
+            ReflectionTestUtils.setField(boss, "detailSession", session);
+            BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                    () -> boss.loadNextJobBatch("Java实习", 2));
+            assertTrue(stopped.getMessage().contains("搜索筛选条件已改变"));
+        } finally {
+            ReflectionTestUtils.setField(boss, "detailSession", null);
+        }
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void cancellationDuringDiagnosisPropagatesWithoutTurningIntoNormalExhaustion() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        AtomicBoolean stopped = new AtomicBoolean();
+        boss.setShouldStopCallback(stopped::get);
+        doAnswer(call -> {
+            stopped.set(true);
+            ((Runnable) call.getArgument(1)).run();
+            return new PageDiagnosticResult(PageDiagnosticResult.State.EXHAUSTED, List.of("没有更多岗位了"));
+        }).when(diagnosis).diagnose(eq(page), any(Runnable.class));
+
+        assertThrows(CancellationException.class, () -> boss.loadNextJobBatch("Java实习", 2));
+
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    @Test
+    void safetyPageAppearingWhileDiagnosisRunsOverridesItsExhaustedResult() {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(PageDiagnosticResult.State.EXHAUSTED);
+        doAnswer(call -> {
+            when(page.url()).thenReturn("https://www.zhipin.com/web/user/safe/verify-slider");
+            return new PageDiagnosticResult(PageDiagnosticResult.State.EXHAUSTED, List.of("没有更多岗位了"));
+        }).when(diagnosis).diagnose(eq(page), any(Runnable.class));
+
+        BossTaskPausedException stopped = assertThrows(BossTaskPausedException.class,
+                () -> boss.loadNextJobBatch("Java实习", 2));
+
+        assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, stopped.getReason());
+        verifyOneScrollWithoutNavigationOrSend();
+    }
+
+    private BossListPageDiagnosis timedOutDiagnosis(PageDiagnosticResult.State state) {
+        BossListPageDiagnosis diagnosis = mock(BossListPageDiagnosis.class);
+        ReflectionTestUtils.setField(boss, "listPageDiagnosisEnabled", true);
+        ReflectionTestUtils.setField(boss, "listPageDiagnosis", diagnosis);
+        when(cards.count()).thenReturn(2);
+        when(cards.evaluateAll(Boss.LIST_SNAPSHOT_SCRIPT)).thenAnswer(ignored -> diagnosticCards.get());
+        doThrow(new TimeoutError("mocked slow next batch"))
+                .when(page).waitForCondition(any(BooleanSupplier.class), any(Page.WaitForConditionOptions.class));
+        when(diagnosis.diagnose(eq(page), any(Runnable.class))).thenAnswer(call -> {
+            ((Runnable) call.getArgument(1)).run();
+            List<String> evidence = switch (state) {
+                case EXHAUSTED -> List.of("没有更多岗位了");
+                case SECURITY_VERIFICATION -> List.of("安全验证");
+                case LOADING -> List.of("加载中");
+                case UNKNOWN -> List.of();
+            };
+            return new PageDiagnosticResult(state, evidence);
+        });
+        return diagnosis;
+    }
+
+    private BossListPageDiagnosis diagnosisWithListChange(PageDiagnosticResult.State state, List<String> after) {
+        BossListPageDiagnosis diagnosis = timedOutDiagnosis(state);
+        doAnswer(call -> {
+            ((Runnable) call.getArgument(1)).run();
+            diagnosticCards.set(after);
+            return new PageDiagnosticResult(state, state == PageDiagnosticResult.State.SECURITY_VERIFICATION
+                    ? List.of("安全验证") : List.of("没有更多岗位了"));
+        }).when(diagnosis).diagnose(eq(page), any(Runnable.class));
+        return diagnosis;
+    }
+
+    private void verifyOneScrollWithoutNavigationOrSend() {
+        verify(page, times(1)).evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
+        verify(page, times(1)).waitForCondition(any(BooleanSupplier.class), any(Page.WaitForConditionOptions.class));
+        verify(page, never()).navigate(anyString(), any(Page.NavigateOptions.class));
+        verify(page, never()).reload();
+        verify(page, never()).context();
+        verify(cards, never()).nth(anyInt());
     }
 
     @Test

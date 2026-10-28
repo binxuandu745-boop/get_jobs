@@ -20,6 +20,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -215,7 +216,7 @@ class BossSafetyStopTest {
         }).when(page).waitForTimeout(anyDouble());
 
         try (MockedStatic<PlaywrightUtil> sleeps = mockStatic(PlaywrightUtil.class)) {
-            assertEquals(0, boss.execute());
+            assertThrows(CancellationException.class, boss::execute);
         }
         verify(page, times(1)).waitForTimeout(anyDouble());
         verify(page, never()).waitForCondition(any(BooleanSupplier.class), any(Page.WaitForConditionOptions.class));
@@ -285,7 +286,7 @@ class BossSafetyStopTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"ROLE", "SALARY", "ROLE_BLACKLIST", "HR_INACTIVE", "COMPANY_BLACKLIST", "RECRUITER_BLACKLIST"})
+    @ValueSource(strings = {"ROLE", "SALARY", "ROLE_BLACKLIST", "HR_INACTIVE", "HR_MONTH", "HR_MISSING", "COMPANY_BLACKLIST", "RECRUITER_BLACKLIST"})
     void everyRejectedJobSkipsProcessingDelayButKeepsItsPreClickDelay(String rejection) {
         BossConfig config = useSingleJobSearch();
         JSONObject job = new JSONObject().put("jobName", "Java后端实习生")
@@ -302,6 +303,14 @@ class BossSafetyStopTest {
             case "HR_INACTIVE" -> {
                 config.setFilterDeadHR(true);
                 recruiter.put("activeTimeDesc", "1年前活跃");
+            }
+            case "HR_MONTH" -> {
+                config.setFilterDeadHR(true);
+                recruiter.put("activeTimeDesc", "本月活跃");
+            }
+            case "HR_MISSING" -> {
+                config.setFilterDeadHR(true);
+                recruiter.remove("activeTimeDesc");
             }
             case "COMPANY_BLACKLIST" -> ReflectionTestUtils.setField(boss, "blackCompanies", Set.of("Test"));
             case "RECRUITER_BLACKLIST" -> ReflectionTestUtils.setField(boss, "blackRecruiters", Set.of("HR"));

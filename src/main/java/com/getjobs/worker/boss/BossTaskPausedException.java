@@ -7,7 +7,11 @@ public final class BossTaskPausedException extends IllegalStateException {
     private final Reason reason;
 
     private BossTaskPausedException(Reason reason, String message) {
-        super(message);
+        this(reason, message, null);
+    }
+
+    private BossTaskPausedException(Reason reason, String message, Throwable cause) {
+        super(message, cause);
         this.reason = reason;
     }
 
@@ -18,9 +22,18 @@ public final class BossTaskPausedException extends IllegalStateException {
                 "已暂停：请在 Boss 浏览器手动完成安全验证，再重新开始；程序不会代办验证");
     }
 
+    public static BossTaskPausedException pageAccessRestricted() {
+        return new BossTaskPausedException(Reason.SECURITY_VERIFICATION,
+                "已暂停：页面截图识别到安全验证或访问限制提示，请手动检查 Boss 浏览器页面后再开始");
+    }
+
     public static BossTaskPausedException detailsUnavailable(String detail) {
+        return detailsUnavailable(detail, null);
+    }
+
+    public static BossTaskPausedException detailsUnavailable(String detail, Throwable cause) {
         return new BossTaskPausedException(Reason.JOB_DETAILS_UNAVAILABLE,
-                "已暂停：" + detail + "；请检查浏览器页面，确认后再手动开始。尚未确认是否触发安全验证");
+                "已暂停：" + detail + "；请检查浏览器页面，确认后再手动开始。尚未确认是否触发安全验证", cause);
     }
 
     public static BossTaskPausedException searchFiltersChanged() {

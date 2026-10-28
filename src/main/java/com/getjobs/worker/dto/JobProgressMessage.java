@@ -18,7 +18,7 @@ public class JobProgressMessage {
     private String platform;
 
     /**
-     * 消息类型 (info, progress, success, error, warning)
+     * 消息类型 (info, progress, success, stopped, error, warning)
      */
     private String type;
 
@@ -61,6 +61,13 @@ public class JobProgressMessage {
      */
     public static JobProgressMessage success(String platform, String message) {
         return new JobProgressMessage(platform, "success", message, null, null, System.currentTimeMillis());
+    }
+
+    /**
+     * 任务已结束但未达到目标数量，例如用户停止或没有新增岗位。
+     */
+    public static JobProgressMessage stopped(String platform, String message) {
+        return new JobProgressMessage(platform, "stopped", message, null, null, System.currentTimeMillis());
     }
 
     /**

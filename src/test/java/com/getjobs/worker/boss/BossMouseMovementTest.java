@@ -1,5 +1,9 @@
 package com.getjobs.worker.boss;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Mouse;
 import com.microsoft.playwright.Page;
@@ -9,6 +13,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -269,14 +274,31 @@ class BossMouseMovementTest {
 
     @Test
     void operationalFailureIsSanitizedAndDoesNotFallBackToInstantClick() {
-        doThrow(new IllegalStateException("private URL token"))
-                .when(mouse).move(anyDouble(), anyDouble());
+        IllegalStateException original = new IllegalStateException("https://private.invalid/?token=secret");
+        doThrow(original).when(mouse).move(anyDouble(), anyDouble());
+        Logger logger = (Logger) LoggerFactory.getLogger(BossMouseMovement.class);
+        Level previousLevel = logger.getLevel();
+        ListAppender<ILoggingEvent> logs = new ListAppender<>();
+        logs.start();
+        logger.setLevel(Level.TRACE);
+        logger.addAppender(logs);
+        try {
+            var failure = assertThrows(BossTaskPausedException.class,
+                    () -> movement.moveTo(page, target, () -> {}, 450, 1100));
 
-        var failure = assertThrows(BossTaskPausedException.class,
-                () -> movement.moveTo(page, target, () -> {}, 450, 1100));
-
-        assertFalse(failure.getMessage().contains("private"));
-        verify(target, never()).click();
+            assertSame(original, failure.getCause());
+            assertTrue(failure.getMessage().contains("移动指针"));
+            assertFalse(failure.getMessage().contains("private"));
+            assertFalse(failure.getMessage().contains("token"));
+            assertTrue(logs.list.stream().map(ILoggingEvent::getFormattedMessage)
+                    .noneMatch(message -> message.contains("private.invalid") || message.contains("token=secret")));
+            verify(target, never()).click();
+            verify(mouse, never()).click(anyDouble(), anyDouble());
+        } finally {
+            logger.detachAppender(logs);
+            logger.setLevel(previousLevel);
+            logs.stop();
+        }
     }
 
     private static BoundingBox box(double x, double y, double width, double height) {

@@ -54,6 +54,9 @@ public final class BossSearchContext {
         catch (IllegalArgumentException invalid) { return false; }
     }
 
+    /** Immutable, normalized semantic filters; unknown tracking parameters are not included. */
+    Map<String, String> filters() { return filters; }
+
     private static String decode(String value) { return URLDecoder.decode(value, StandardCharsets.UTF_8); }
 
     private static String normalizeFilter(String raw) {

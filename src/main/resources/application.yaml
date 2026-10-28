@@ -62,10 +62,18 @@ getjobs:
     platform-mode: liepin # 未保存前端选择时的启动默认值；支持boss/liepin/51job/zhilian；all仅旧配置兼容
     boss-only: true # 仅作旧配置兼容；当前只初始化猎聘
   boss:
-    screenshot-analysis-enabled: true # 网页保存的开关优先；截图提取岗位字段，再由Java筛选后沟通
+    screenshot-analysis-enabled: false # 默认使用原岗位详情数据筛选；网页保存的截图开关优先
     preview-only: false # 允许真实投递；启动助手本身不会自动发起任务
+    manual-filter-setup-enabled: true # 每次手动开始后，在BOSS网页提供一次筛选设置时间
+    manual-filter-setup-wait-ms: 10000 # 列表加载后等待10秒，后续自动轮次沿用手动选择
+    auto-rounds-enabled: true # 手动开始后顺序运行各轮；停止、保护性暂停或异常不会自动重启
+    round-size: 50 # 每轮成功发送招呼的上限，过滤和重复岗位不计入
+    total-target: 150 # 本次手动启动的累计投递目标，达到后结束
+    max-rounds: 30 # 岗位不足时防止无限空转
+    max-empty-rounds: 3 # 连续三轮无新增投递时结束并提示检查条件
     pause-desktop-alert-enabled: true # 保护性暂停时弹出桌面置顶提示，关闭提示不会恢复任务
     detail-response-timeout-ms: 60000 # 详情响应等待上限；超时为读取失败，不等同于安全验证
+    list-page-diagnosis-enabled: true # 下一批岗位超时后，复用截图AI配置诊断一次；无法确认仍暂停
     max-preview-jobs: 5
     required-role-terms: "Java,后端,服务端"
     require-internship: false # 不因标题或描述缺少“实习”而排除 Java／后端岗位
@@ -79,7 +87,10 @@ getjobs:
     action-delay-max-ms: 500 # 每次在最短与最长等待之间取随机值
     mouse-movement-enabled: true # 每次点击前在页面内分段移动鼠标；不接管系统鼠标
     mouse-movement-min-ms: 450 # 单次移动的计划耗时下限，实际还包含浏览器调用耗时
-    mouse-movement-max-ms: 10 # 每次随机耗时并缓入缓出；移动期间仍检查停止与岗位身份
+    mouse-movement-max-ms: 1100 # 与450毫秒下限组成有效随机范围；实际还包含浏览器调用耗时
+    mouse-target-randomization-enabled: true # 在目标内选取落点，最终点击沿用该点；关闭则恢复中心落点
+    mouse-target-inset-ratio: 0.25 # 四边各内缩25%，在中间50%区域取点；有效范围0.05至0.45
+    mouse-path-variation-enabled: true # 可变落点模式下使用独立控制点曲线；false沿用原弧线
 
 
 

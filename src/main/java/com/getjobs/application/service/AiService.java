@@ -18,6 +18,7 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 /**
  * AI 服务（Spring 管理）
@@ -71,6 +72,11 @@ public class AiService {
             message.put("content", content);
             messages.put(message);
             requestData.put("messages", messages);
+            if (model != null && model.toLowerCase(Locale.ROOT).startsWith("deepseek-")) {
+                // 短招呼无需推理过程；仅向 DeepSeek 的 Chat Completions 请求添加这些参数。
+                requestData.put("thinking", new JSONObject().put("type", "disabled"));
+                requestData.put("max_tokens", 400);
+            }
         }
 
         HttpRequest request = HttpRequest.newBuilder()
@@ -119,14 +125,19 @@ public class AiService {
                 int promptTokens = usageObject != null ? usageObject.optInt("prompt_tokens", -1) : -1;
                 int completionTokens = usageObject != null ? usageObject.optInt("completion_tokens", -1) : -1;
                 int totalTokens = usageObject != null ? usageObject.optInt("total_tokens", -1) : -1;
+                JSONObject completionDetails = usageObject != null
+                        ? usageObject.optJSONObject("completion_tokens_details") : null;
+                int reasoningTokens = completionDetails != null
+                        ? completionDetails.optInt("reasoning_tokens", -1) : -1;
 
                 LocalDateTime createdTime = created > 0
                         ? Instant.ofEpochSecond(created).atZone(ZoneId.systemDefault()).toLocalDateTime()
                         : LocalDateTime.now();
                 DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
-                log.info("AI响应: id={}, time={}, model={}, promptTokens={}, completionTokens={}, totalTokens={}",
-                        requestId, createdTime.format(formatter), usedModel, promptTokens, completionTokens, totalTokens);
+                log.info("AI响应: id={}, time={}, model={}, promptTokens={}, completionTokens={}, totalTokens={}, reasoningTokens={}",
+                        requestId, createdTime.format(formatter), usedModel, promptTokens, completionTokens,
+                        totalTokens, reasoningTokens);
 
                 return responseContent;
             } else {

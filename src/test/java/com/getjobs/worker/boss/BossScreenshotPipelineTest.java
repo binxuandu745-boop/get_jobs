@@ -1,5 +1,9 @@
 package com.getjobs.worker.boss;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.getjobs.application.screenshot.BossScreenshotSettingsService;
 import com.getjobs.application.screenshot.OfflineScreenshotService;
 import com.getjobs.application.screenshot.ScreenshotAnalysisResult;
@@ -15,19 +19,23 @@ import com.getjobs.worker.utils.PlaywrightUtil;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
+import com.microsoft.playwright.TimeoutError;
 import org.json.JSONObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.MockedStatic;
 import org.mockito.MockedConstruction;
+import org.slf4j.LoggerFactory;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -55,6 +63,7 @@ class BossScreenshotPipelineTest {
     private Locator chat;
     private Locator input;
     private Locator send;
+    private Locator close;
     private AtomicBoolean stopped;
     private AtomicReference<String> selectedHref;
 
@@ -102,7 +111,7 @@ class BossScreenshotPipelineTest {
         send = selfLocator();
         when(detailPage.locator(SEND)).thenReturn(send);
         when(send.count()).thenReturn(1);
-        Locator close = selfLocator();
+        close = selfLocator();
         when(detailPage.locator("i.icon-close")).thenReturn(close);
         when(greeting.sendRequest(anyString())).thenReturn("vision-based greeting");
     }
@@ -134,6 +143,262 @@ class BossScreenshotPipelineTest {
                         && "未投递".equals(entity.getDeliveryStatus())));
         verify(records).updateDeliveryStatus(ID, HR, "已投递");
         verify(detailPage, atLeastOnce()).close();
+        verify(listPage, never()).close();
+    }
+
+    @Test
+    void sendMovementFailurePausesWithoutRetryingOrRecordingDelivery() throws Exception {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any()))
+                .thenReturn(result("COMPLETE", "MATCH", fields()));
+        BossMouseMovement movement = mock(BossMouseMovement.class);
+        ReflectionTestUtils.setField(boss, "mouseMovement", movement);
+        ReflectionTestUtils.setField(boss, "mouseMovementEnabled", true);
+        ReflectionTestUtils.setField(boss, "mouseMovementMinMs", 450);
+        ReflectionTestUtils.setField(boss, "mouseMovementMaxMs", 1100);
+        BossTaskPausedException paused = BossTaskPausedException.detailsUnavailable("test movement unavailable");
+        doThrow(paused).when(movement).moveTo(eq(detailPage), eq(send),
+                any(Runnable.class), eq(450), eq(1100));
+
+        Logger logger = (Logger) LoggerFactory.getLogger(Boss.class);
+        Level previousLevel = logger.getLevel();
+        ListAppender<ILoggingEvent> logs = new ListAppender<>();
+        logs.start();
+        logger.setLevel(Level.TRACE);
+        logger.addAppender(logs);
+        try {
+            assertSame(paused, assertThrows(BossTaskPausedException.class, this::processCurrentJob));
+
+            verify(chat, times(1)).click();
+            verify(input).fill("vision-based greeting");
+            verify(send, never()).click();
+            verify(close, never()).click();
+            verify(movement, times(1)).moveTo(eq(detailPage), eq(send),
+                    any(Runnable.class), eq(450), eq(1100));
+            verify(movement, never()).moveTo(eq(detailPage), eq(close),
+                    any(Runnable.class), eq(450), eq(1100));
+            verify(records, never()).updateDeliveryStatus(anyString(), anyString(), eq("已投递"));
+            assertTrue(boss.getResultList().isEmpty());
+            List<String> failures = logs.list.stream()
+                    .filter(event -> event.getLevel().isGreaterOrEqual(Level.WARN))
+                    .map(ILoggingEvent::getFormattedMessage).toList();
+            assertTrue(failures.stream().anyMatch(message -> message.contains("发送招呼")
+                    && message.contains("阶段")), () -> "Missing failed action diagnostic: " + failures);
+            assertFalse(failures.stream().anyMatch(message -> message.contains("关闭聊天小窗")));
+            verify(detailPage).close();
+            verify(listPage, never()).close();
+        } finally {
+            logger.detachAppender(logs);
+            logger.setLevel(previousLevel);
+            logs.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "https://www.zhipin.com/web/geek/chat",
+            "https://www.zhipin.com/web/geek/chat?jobId=test-id"
+    })
+    void standaloneChatNeverLooksForOrClicksPopupCloseEvenWhenAnIconExists(String chatUrl) throws Throwable {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any()))
+                .thenReturn(result("COMPLETE", "MATCH", fields()));
+        when(close.count()).thenReturn(1);
+        when(close.isVisible()).thenReturn(true);
+        doAnswer(ignored -> {
+            when(detailPage.url()).thenReturn(chatUrl);
+            return null;
+        }).when(chat).click();
+
+        processCurrentJob();
+
+        verify(detailPage, never()).locator("i.icon-close");
+        verifyNoInteractions(close);
+        assertGreetingRecordedOnceAndOnlyOwnedPageClosed();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void absentOrHiddenPopupCloseDoesNotAttemptCleanup(boolean iconExists) throws Throwable {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any()))
+                .thenReturn(result("COMPLETE", "MATCH", fields()));
+        when(close.count()).thenReturn(iconExists ? 1 : 0);
+        when(close.isVisible()).thenReturn(false);
+
+        processCurrentJob();
+
+        verify(close, never()).click();
+        verify(close, never()).click(any(Locator.ClickOptions.class));
+        assertGreetingRecordedOnceAndOnlyOwnedPageClosed();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void visiblePopupCleanupUsesOneBoundedClickWithoutMouseMovementAndKeepsSentGreeting(boolean closeTimesOut)
+            throws Throwable {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any()))
+                .thenReturn(result("COMPLETE", "MATCH", fields()));
+        when(close.count()).thenReturn(1);
+        when(close.isVisible()).thenReturn(true);
+        BossMouseMovement movement = mock(BossMouseMovement.class);
+        ReflectionTestUtils.setField(boss, "mouseMovement", movement);
+        ReflectionTestUtils.setField(boss, "mouseMovementEnabled", true);
+        ReflectionTestUtils.setField(boss, "mouseMovementMinMs", 450);
+        ReflectionTestUtils.setField(boss, "mouseMovementMaxMs", 1100);
+        if (closeTimesOut) {
+            doThrow(new TimeoutError("popup disappeared during cleanup"))
+                    .when(close).click(any(Locator.ClickOptions.class));
+        }
+
+        processCurrentJob();
+
+        verify(close, times(1)).click(argThat(options -> Double.valueOf(1000).equals(options.timeout)));
+        verify(close, never()).click();
+        verify(movement, never()).moveTo(eq(detailPage), eq(close), any(Runnable.class), anyInt(), anyInt());
+        var order = inOrder(send, records, close);
+        order.verify(send).click();
+        order.verify(records).updateDeliveryStatus(ID, HR, "已投递");
+        order.verify(close).click(any(Locator.ClickOptions.class));
+        assertGreetingRecordedOnceAndOnlyOwnedPageClosed();
+    }
+
+    @ParameterizedTest
+    @CsvSource({"verification,false", "cancel,false", "identity,false",
+            "verification,true", "cancel,true", "identity,true"})
+    void protectiveStopAfterSendOrCleanupFailureKeepsRecordedGreeting(String reason, boolean duringCleanup)
+            throws Exception {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any()))
+                .thenReturn(result("COMPLETE", "MATCH", fields()));
+        Runnable triggerStop = () -> {
+            switch (reason) {
+                case "verification" -> when(detailPage.url())
+                        .thenReturn("https://www.zhipin.com/web/passport/zp/verify.html");
+                case "cancel" -> stopped.set(true);
+                case "identity" -> when(detailPage.url())
+                        .thenReturn("https://www.zhipin.com/job_detail/other-job.html");
+                default -> throw new AssertionError("Unexpected stop reason: " + reason);
+            }
+        };
+        if (duringCleanup) {
+            when(close.count()).thenReturn(1);
+            when(close.isVisible()).thenReturn(true);
+            doAnswer(ignored -> {
+                triggerStop.run();
+                throw new TimeoutError("cleanup interrupted by changed page state");
+            }).when(close).click(any(Locator.ClickOptions.class));
+        } else {
+            doAnswer(ignored -> {
+                triggerStop.run();
+                return null;
+            }).when(send).click();
+        }
+
+        if ("cancel".equals(reason)) {
+            assertThrows(CancellationException.class, this::processCurrentJob);
+        } else {
+            BossTaskPausedException failure = assertThrows(BossTaskPausedException.class, this::processCurrentJob);
+            assertEquals("verification".equals(reason)
+                    ? BossTaskPausedException.Reason.SECURITY_VERIFICATION
+                    : BossTaskPausedException.Reason.JOB_DETAILS_UNAVAILABLE, failure.getReason());
+        }
+
+        if (duringCleanup) {
+            verify(close, times(1)).click(any(Locator.ClickOptions.class));
+        } else {
+            verify(detailPage, never()).locator("i.icon-close");
+            verifyNoInteractions(close);
+        }
+        assertGreetingRecordedOnceAndOnlyOwnedPageClosed();
+    }
+
+    @Test
+    void jsonSubmissionToStandaloneChatRecordsOnceAndClosesOnlyItsNewDetailPage() throws Throwable {
+        Job job = prepareJsonSubmission();
+        when(close.count()).thenReturn(1);
+        when(close.isVisible()).thenReturn(true);
+        doAnswer(ignored -> {
+            when(detailPage.url()).thenReturn("https://www.zhipin.com/web/geek/chat");
+            return null;
+        }).when(chat).click();
+
+        submitJsonJob(job);
+
+        verify(detailPage).navigate(eq(DETAIL_URL), any(Page.NavigateOptions.class));
+        verify(input).fill("fallback greeting");
+        verify(detailPage, never()).locator("i.icon-close");
+        verifyNoInteractions(close, screening, greeting);
+        assertGreetingRecordedOnceAndOnlyOwnedPageClosed();
+        assertSame(job, boss.getResultList().getFirst());
+    }
+
+    @Test
+    void jsonSubmissionVerificationAfterSendKeepsSentRecordAndLeavesDetailPageForInspection() {
+        Job job = prepareJsonSubmission();
+        doAnswer(ignored -> {
+            when(detailPage.url()).thenReturn("https://www.zhipin.com/web/passport/zp/verify.html");
+            return null;
+        }).when(send).click();
+
+        BossTaskPausedException failure = assertThrows(BossTaskPausedException.class, () -> submitJsonJob(job));
+
+        assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, failure.getReason());
+        verify(chat, times(1)).click();
+        verify(send, times(1)).click();
+        verify(records, times(1)).updateDeliveryStatus(ID, HR, "已投递");
+        verify(records, never()).updateDeliveryStatus(anyString(), anyString(), eq("投递失败"));
+        assertEquals(1, boss.getResultList().size());
+        assertSame(job, boss.getResultList().getFirst());
+        verify(detailPage, never()).locator("i.icon-close");
+        verify(detailPage, never()).close();
+        verify(listPage, never()).close();
+        verifyNoInteractions(close, screening, greeting);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void jsonSubmissionOwnedPageCloseFailureDoesNotChangeSuccessOrRetry(boolean playwrightFailure) throws Throwable {
+        Job job = prepareJsonSubmission();
+        RuntimeException failure = playwrightFailure
+                ? new TimeoutError("owned detail page close failed")
+                : new IllegalStateException("owned detail page close failed");
+        doThrow(failure).when(detailPage).close();
+
+        submitJsonJob(job);
+
+        assertGreetingRecordedOnceAndOnlyOwnedPageClosed();
+        assertSame(job, boss.getResultList().getFirst());
+        verifyNoInteractions(screening, greeting);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Job prepareJsonSubmission() {
+        ((Map<String, String>) ReflectionTestUtils.getField(boss, "encryptIdToUserId")).put(ID, HR);
+        config.setEnableAI(false);
+        Job job = new Job();
+        job.setJobName("Java JSON实习");
+        job.setCompanyName("JSON测试公司");
+        job.setSalary("6-8K");
+        return job;
+    }
+
+    private void submitJsonJob(Job job) throws Throwable {
+        Method method = Boss.class.getDeclaredMethod("resumeSubmission", String.class, Job.class);
+        method.setAccessible(true);
+        try (MockedStatic<PlaywrightUtil> ignored = mockStatic(PlaywrightUtil.class)) {
+            try {
+                method.invoke(boss, "Java实习", job);
+            } catch (InvocationTargetException failure) {
+                throw failure.getCause();
+            }
+        }
+    }
+
+    private void assertGreetingRecordedOnceAndOnlyOwnedPageClosed() {
+        verify(chat, times(1)).click();
+        verify(send, times(1)).click();
+        verify(records, times(1)).updateDeliveryStatus(ID, HR, "已投递");
+        verify(records, never()).updateDeliveryStatus(anyString(), anyString(), eq("投递失败"));
+        assertEquals(1, boss.getResultList().size());
+        verify(detailPage, times(1)).close();
+        verify(listPage, never()).close();
     }
 
     @Test
@@ -212,6 +477,31 @@ class BossScreenshotPipelineTest {
         assertTrue(boss.getResultList().isEmpty());
         verify(records).recordScreenshotObservation(argThat(entity -> "已过滤".equals(entity.getDeliveryStatus())));
         verify(detailPage).close();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"本月活跃", "3日内活跃", ""})
+    void recentActivityFilterBlocksScreenshotMatchAndRecordsFiltered(String activity) throws Throwable {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any())).thenReturn(result("COMPLETE", "MATCH", fields()));
+        JSONObject root = new JSONObject(jsonDetail().body());
+        root.getJSONObject("zpData").getJSONObject("bossInfo").put("activeTimeDesc", activity);
+        processCurrentJob(new BossJobDetailReader.Detail(root.toString(), root));
+
+        verify(records).recordScreenshotObservation(argThat(entity -> "已过滤".equals(entity.getDeliveryStatus())));
+        verify(detailPage, never()).locator(CHAT);
+        verifyNoInteractions(greeting);
+    }
+
+    @Test
+    void missingRecruiterBlocksScreenshotMatchAndRecordsFiltered() throws Throwable {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any())).thenReturn(result("COMPLETE", "MATCH", fields()));
+        JSONObject root = new JSONObject(jsonDetail().body());
+        root.getJSONObject("zpData").remove("bossInfo");
+        processCurrentJob(new BossJobDetailReader.Detail(root.toString(), root));
+
+        verify(records).recordScreenshotObservation(argThat(entity -> "已过滤".equals(entity.getDeliveryStatus())));
+        verify(detailPage, never()).locator(CHAT);
+        verifyNoInteractions(greeting);
     }
 
     @Test
@@ -297,6 +587,41 @@ class BossScreenshotPipelineTest {
 
         verify(chat, never()).click();
         verifyNoInteractions(greeting);
+        assertTrue(boss.getResultList().isEmpty());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"chat-button", "chat-input"})
+    void verificationAppearingDuringCommunicationReadinessPollingKeepsSecurityClassification(String stage)
+            throws Exception {
+        when(screening.analyze(eq(detailPage), eq(ID), any(), any()))
+                .thenReturn(result("COMPLETE", "MATCH", fields()));
+        Runnable showVerification = () -> when(detailPage.url())
+                .thenReturn("https://www.zhipin.com/web/passport/zp/verify.html");
+        if ("chat-button".equals(stage)) {
+            // The first button lookup is not ready; the next poll observes the verification URL.
+            when(chat.count()).thenAnswer(ignored -> {
+                showVerification.run();
+                return 0;
+            });
+        } else {
+            when(input.count()).thenReturn(0);
+            // Only the input-readiness loop waits for 500ms; all browser calls remain mocks.
+            doAnswer(ignored -> {
+                showVerification.run();
+                return null;
+            }).when(detailPage).waitForTimeout(500);
+        }
+
+        BossTaskPausedException failure = assertThrows(BossTaskPausedException.class, this::processCurrentJob);
+
+        assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, failure.getReason());
+        verify(chat, times("chat-input".equals(stage) ? 1 : 0)).click();
+        if ("chat-input".equals(stage)) verify(detailPage, times(1)).waitForTimeout(500);
+        verify(input, never()).fill(anyString());
+        verify(send, never()).click();
+        verifyNoInteractions(greeting);
+        verify(records, never()).updateDeliveryStatus(anyString(), anyString(), eq("已投递"));
         assertTrue(boss.getResultList().isEmpty());
     }
 
@@ -487,11 +812,15 @@ class BossScreenshotPipelineTest {
     }
 
     private void processCurrentJob() throws Throwable {
+        processCurrentJob(jsonDetail());
+    }
+
+    private void processCurrentJob(BossJobDetailReader.Detail detail) throws Throwable {
         Method method = Boss.class.getDeclaredMethod("processScreenshotJob", String.class, BossJobDetailReader.Detail.class);
         method.setAccessible(true);
         try (MockedStatic<PlaywrightUtil> ignored = mockStatic(PlaywrightUtil.class)) {
             try {
-                method.invoke(boss, "Java实习", jsonDetail());
+                method.invoke(boss, "Java实习", detail);
             } catch (InvocationTargetException failure) {
                 throw failure.getCause();
             }

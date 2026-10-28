@@ -22,6 +22,7 @@ class BossMouseClickTest {
     private Boss boss;
     private Page page;
     private Locator target;
+    private Locator verification;
     private BossMouseMovement movement;
     private AtomicBoolean stopped;
 
@@ -35,7 +36,7 @@ class BossMouseClickTest {
         boss.setPage(page);
         boss.setShouldStopCallback(stopped::get);
         when(page.url()).thenReturn("https://www.zhipin.com/web/geek/jobs");
-        Locator verification = mock(Locator.class);
+        verification = mock(Locator.class);
         when(verification.first()).thenReturn(verification);
         when(page.locator(BossPageSafety.VERIFICATION_SELECTOR)).thenReturn(verification);
         ReflectionTestUtils.setField(boss, "mouseMovement", movement);
@@ -168,6 +169,102 @@ class BossMouseClickTest {
 
         assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, failure.getReason());
         verifyNoInteractions(movement);
+        verify(target, never()).click();
+    }
+
+    @Test
+    void rapidMovementCheckpointsDoNotRepeatFullDomProbesButFinalClickStillDoes() throws Throwable {
+        Runnable identity = mock(Runnable.class);
+        doAnswer(call -> {
+            Runnable checkpoint = call.getArgument(2);
+            for (int step = 0; step < 20; step++) checkpoint.run();
+            // No time has deliberately elapsed, so only the initial full probe is needed here.
+            verify(verification, times(1)).isVisible();
+            verify(target, never()).click();
+            return null;
+        }).when(movement).moveTo(eq(page), eq(target), any(Runnable.class), anyInt(), anyInt());
+
+        click(identity);
+
+        verify(verification, times(2)).isVisible();
+        verify(identity, atLeast(22)).run();
+        verify(target, times(1)).click();
+    }
+
+    @Test
+    void verificationDomAppearingDuringMovementIsCaughtByUnconditionalFinalProbe() {
+        doAnswer(call -> {
+            when(verification.isVisible()).thenReturn(true);
+            ((Runnable) call.getArgument(2)).run();
+            return null;
+        }).when(movement).moveTo(eq(page), eq(target), any(Runnable.class), anyInt(), anyInt());
+
+        BossTaskPausedException failure = assertThrows(BossTaskPausedException.class,
+                () -> click(() -> { }));
+
+        assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, failure.getReason());
+        verify(verification, times(2)).isVisible();
+        verify(target, never()).click();
+    }
+
+    @Test
+    void verificationUrlAppearingDuringMovementStopsAtNextLocalCheckpoint() {
+        doAnswer(call -> {
+            when(page.url()).thenReturn("https://www.zhipin.com/web/passport/zp/verify.html");
+            ((Runnable) call.getArgument(2)).run();
+            fail("verification URL must stop movement immediately");
+            return null;
+        }).when(movement).moveTo(eq(page), eq(target), any(Runnable.class), anyInt(), anyInt());
+
+        BossTaskPausedException failure = assertThrows(BossTaskPausedException.class,
+                () -> click(() -> { }));
+
+        assertEquals(BossTaskPausedException.Reason.SECURITY_VERIFICATION, failure.getReason());
+        verify(verification, times(1)).isVisible();
+        verify(target, never()).click();
+    }
+
+    @Test
+    void backgroundSearchPageClosingDuringMovementStopsAtNextLocalCheckpoint() {
+        Page detailPage = mock(Page.class);
+        Locator detailVerification = mock(Locator.class);
+        when(detailPage.url()).thenReturn("https://www.zhipin.com/job_detail/test.html");
+        when(detailPage.locator(BossPageSafety.VERIFICATION_SELECTOR)).thenReturn(detailVerification);
+        when(detailVerification.first()).thenReturn(detailVerification);
+        doAnswer(call -> {
+            when(page.isClosed()).thenReturn(true);
+            ((Runnable) call.getArgument(2)).run();
+            fail("closed background page must stop movement immediately");
+            return null;
+        }).when(movement).moveTo(eq(detailPage), eq(target), any(Runnable.class), anyInt(), anyInt());
+
+        BossTaskPausedException failure = assertThrows(BossTaskPausedException.class,
+                () -> invoke("clickWithMouse", new Class<?>[]{Page.class, Locator.class, Runnable.class},
+                        detailPage, target, (Runnable) () -> { }));
+
+        assertEquals(BossTaskPausedException.Reason.JOB_DETAILS_UNAVAILABLE, failure.getReason());
+        verify(verification, times(1)).isVisible();
+        verify(detailVerification, times(1)).isVisible();
+        verify(target, never()).click();
+    }
+
+    @Test
+    void observedSearchContextChangeDuringMovementStopsAtNextLocalCheckpoint() {
+        BossJobDetailSession session = mock(BossJobDetailSession.class);
+        ReflectionTestUtils.setField(boss, "detailSession", session);
+        BossTaskPausedException contextChanged = BossTaskPausedException.detailsUnavailable("test context changed");
+        doAnswer(call -> {
+            doThrow(contextChanged).when(session).requireSearchContextUnchanged();
+            ((Runnable) call.getArgument(2)).run();
+            fail("changed search context must stop movement immediately");
+            return null;
+        }).when(movement).moveTo(eq(page), eq(target), any(Runnable.class), anyInt(), anyInt());
+
+        BossTaskPausedException failure = assertThrows(BossTaskPausedException.class,
+                () -> click(() -> { }));
+
+        assertSame(contextChanged, failure);
+        verify(verification, times(1)).isVisible();
         verify(target, never()).click();
     }
 

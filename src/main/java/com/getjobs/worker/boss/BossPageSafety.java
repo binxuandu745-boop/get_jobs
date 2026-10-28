@@ -36,6 +36,19 @@ public final class BossPageSafety {
         }
     }
 
+    /** Cached page metadata only: safe to call around every mouse step without a DOM round trip. */
+    static void requireUsablePageMetadata(Page page) {
+        requireNotCancelled();
+        if (page == null || page.isClosed()) {
+            throw BossTaskPausedException.detailsUnavailable("浏览器页面已关闭或不可用");
+        }
+        requireNotCancelled();
+        if (isVerificationUrl(page.url())) {
+            throw BossTaskPausedException.verificationRequired();
+        }
+        requireNotCancelled();
+    }
+
     public static void requireUsablePage(Page page) {
         requireNotCancelled();
         if (page == null) {

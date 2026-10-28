@@ -218,6 +218,60 @@ class ScreenshotVisionClientTest {
         verify(http, times(1)).send(any(HttpRequest.class), inputStreamHandler());
     }
 
+    @Test
+    void pageDiagnosticUsesTheSameConfiguredTransportButADedicatedBoundedPrompt() throws Exception {
+        String result = "{\"state\":\"EXHAUSTED\",\"evidence\":[\"没有更多了\"]}";
+        success(result);
+
+        assertEquals(result, client.diagnosePage(IMAGE, "image/png"));
+
+        ArgumentCaptor<HttpRequest> captured = ArgumentCaptor.forClass(HttpRequest.class);
+        verify(http, times(1)).send(captured.capture(), inputStreamHandler());
+        verify(config, times(1)).requiredConfig();
+        HttpRequest request = captured.getValue();
+        assertEquals(URI.create("https://api.deepseek.com/v1/chat/completions"), request.uri());
+        assertEquals("Bearer " + SYNTHETIC_KEY, request.headers().firstValue("Authorization").orElseThrow());
+        JSONObject payload = new JSONObject(bodyText(request));
+        assertEquals(800, payload.getInt("max_tokens"));
+        assertEquals("disabled", payload.getJSONObject("thinking").getString("type"));
+        assertEquals("json_object", payload.getJSONObject("response_format").getString("type"));
+        JSONArray messages = payload.getJSONArray("messages");
+        String system = messages.getJSONObject(0).getString("content");
+        assertTrue(system.contains("不可信数据"));
+        assertTrue(system.contains("不推断后台风控结果"));
+        JSONArray content = messages.getJSONObject(1).getJSONArray("content");
+        String task = content.getJSONObject(0).getString("text");
+        assertTrue(task.contains("SECURITY_VERIFICATION"));
+        assertTrue(task.contains("EXHAUSTED"));
+        assertTrue(task.contains("安全提示优先"));
+        assertTrue(task.contains("白屏"));
+        assertFalse(task.contains("salaryMin"));
+        assertEquals("data:image/png;base64,AQIDBA==", content.getJSONObject(1).getJSONObject("image_url").getString("url"));
+    }
+
+    @Test
+    void invalidDiagnosticImageFailsBeforeAnyConfigOrTransport() {
+        assertEquals("INVALID_IMAGE", assertThrows(ScreenshotVisionException.class,
+                () -> client.diagnosePage(new byte[0], "image/png")).getCode());
+        assertEquals("INVALID_IMAGE", assertThrows(ScreenshotVisionException.class,
+                () -> client.diagnosePage(IMAGE, "image/svg+xml")).getCode());
+        verifyNoInteractions(config, http);
+    }
+
+    @Test
+    void diagnosticTimeoutDoesNotLeakTransportTextOrRetry() throws Exception {
+        when(http.send(any(HttpRequest.class), inputStreamHandler()))
+                .thenThrow(new HttpTimeoutException("private provider URL and " + SYNTHETIC_KEY));
+
+        ScreenshotVisionException failure = assertThrows(ScreenshotVisionException.class,
+                () -> client.diagnosePage(IMAGE, "image/png"));
+
+        assertEquals("VISION_TIMEOUT", failure.getCode());
+        assertFalse(failure.toString().contains(SYNTHETIC_KEY));
+        assertNull(failure.getCause());
+        verify(http, times(1)).send(any(HttpRequest.class), inputStreamHandler());
+    }
+
     @ParameterizedTest
     @CsvSource({
             "https://provider.example, https://provider.example/v1/chat/completions",

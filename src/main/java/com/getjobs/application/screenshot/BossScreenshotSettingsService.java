@@ -33,7 +33,7 @@ public class BossScreenshotSettingsService {
     }
 
     public BossScreenshotSettingsService(ConfigService config, ObjectMapper mapper,
-            @Value("${getjobs.boss.screenshot-analysis-enabled:true}") boolean defaultEnabled) {
+            @Value("${getjobs.boss.screenshot-analysis-enabled:false}") boolean defaultEnabled) {
         this.config = config;
         this.mapper = mapper;
         this.defaultEnabled = defaultEnabled;

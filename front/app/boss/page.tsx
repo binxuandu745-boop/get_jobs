@@ -197,7 +197,7 @@ export default function BossPage() {
               if (message.platform !== 'boss') return
               progressRevision += 1
               setTaskMessage(message.message || '')
-              if (message.type === 'success' || message.type === 'error') {
+              if (message.type === 'success' || message.type === 'stopped' || message.type === 'error') {
                 setIsDelivering(false)
               }
               if (message.type === 'error') {
@@ -766,7 +766,7 @@ export default function BossPage() {
               
               {/* HR活跃过滤开关 */}
               <div className="space-y-2">
-                <Label htmlFor="filterDeadHr">HR活跃过滤</Label>
+                <Label htmlFor="filterDeadHr">仅联系今日活跃或在线的HR</Label>
                 <Select
                   id="filterDeadHr"
                   value={String(config.filterDeadHr ?? 0)}
@@ -775,7 +775,7 @@ export default function BossPage() {
                   <option value="0">关闭</option>
                   <option value="1">开启</option>
                 </Select>
-                <p className="text-xs text-muted-foreground">开启后将过滤活跃状态包含“年”的HR，但仍保存数据。</p>
+                <p className="text-xs text-muted-foreground">开启后仅允许“今日活跃”“刚刚活跃”或“在线”的HR；本周、本月及更久未活跃、状态缺失或无法确认的均跳过，仍保存岗位数据。</p>
               </div>
               </div>
             </CardContent>
